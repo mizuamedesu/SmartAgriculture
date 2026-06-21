@@ -6,13 +6,18 @@ use std::{
 
 use base64::{Engine, engine::general_purpose};
 use chrono::{DateTime, Local};
-use png::{BitDepth, ColorType, Encoder};
+use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+use png::{BitDepth, ColorType, Encoder as PngEncoder};
 use serde::Serialize;
 
 use crate::capture::{
     ColorFrame, DepthFrame, DepthStats, FramePaths, FrameSummary, Intrinsics,
     ResolvedCaptureConfig, SensorFrame, default_output_root,
 };
+
+const PREVIEW_MAX_WIDTH: u32 = 320;
+const PREVIEW_MAX_HEIGHT: u32 = 180;
+const PREVIEW_JPEG_QUALITY: u8 = 58;
 
 #[derive(Debug, Clone)]
 pub struct SessionPaths {
@@ -134,18 +139,19 @@ pub fn write_frame(
     let color_preview = if let (Some(color), Some(path)) = (&frame.color, &rgb_path) {
         let png = encode_rgb_png(color)?;
         fs::write(path, &png).map_err(|error| format!("failed to write RGB PNG: {error}"))?;
-        Some(data_url("image/png", &png))
+        let preview_jpeg = encode_rgb_preview_jpeg(color)?;
+        Some(data_url("image/jpeg", &preview_jpeg))
     } else {
         None
     };
 
-    let depth_preview_png = encode_depth_preview_png(&frame.depth, config)?;
-    let depth_preview = data_url("image/png", &depth_preview_png);
+    let depth_preview_jpeg = encode_depth_preview_jpeg(&frame.depth, config)?;
+    let depth_preview = data_url("image/jpeg", &depth_preview_jpeg);
     let depth_z16_png = encode_depth_z16_png(&frame.depth)?;
     fs::write(&depth_path, depth_z16_png)
         .map_err(|error| format!("failed to write depth PNG: {error}"))?;
 
-    let stats = depth_stats(&frame.depth, config);
+    let stats = preview_depth_stats(&frame.depth, config);
     let point_count = write_ply(&ply_path, frame, config)?;
     let summary_paths = FramePaths {
         rgb: rgb_path.as_ref().map(path_string),
@@ -183,6 +189,40 @@ pub fn write_frame(
             ..stats
         },
         paths: summary_paths,
+    })
+}
+
+pub fn preview_frame_summary(
+    session_id: &str,
+    config: &ResolvedCaptureConfig,
+    frame_index: u32,
+    frame: &SensorFrame,
+) -> Result<FrameSummary, String> {
+    let color_preview = frame
+        .color
+        .as_ref()
+        .map(encode_rgb_preview_jpeg)
+        .transpose()?
+        .map(|jpeg| data_url("image/jpeg", &jpeg));
+
+    let depth_preview_jpeg = encode_depth_preview_jpeg(&frame.depth, config)?;
+    let depth_preview = data_url("image/jpeg", &depth_preview_jpeg);
+    let stats = depth_stats(&frame.depth, config);
+
+    Ok(FrameSummary {
+        session_id: session_id.to_string(),
+        frame_index,
+        timestamp_ms: frame.timestamp_ms,
+        frame_number: frame.frame_number,
+        color_preview_data_url: color_preview,
+        depth_preview_data_url: depth_preview,
+        depth: stats,
+        paths: FramePaths {
+            rgb: None,
+            depth: "-".to_string(),
+            point_cloud: "-".to_string(),
+            metadata: "-".to_string(),
+        },
     })
 }
 
@@ -279,7 +319,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 fn encode_rgb_png(color: &ColorFrame) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     {
-        let mut encoder = Encoder::new(&mut bytes, color.width, color.height);
+        let mut encoder = PngEncoder::new(&mut bytes, color.width, color.height);
         encoder.set_color(ColorType::Rgb);
         encoder.set_depth(BitDepth::Eight);
         let mut writer = encoder
@@ -292,6 +332,24 @@ fn encode_rgb_png(color: &ColorFrame) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn encode_rgb_preview_jpeg(color: &ColorFrame) -> Result<Vec<u8>, String> {
+    let (width, height) = preview_dimensions(color.width, color.height);
+    let mut rgb = vec![0u8; (width * height * 3) as usize];
+    for y in 0..height as usize {
+        let sy = (y * color.height as usize / height as usize).min(color.height as usize - 1);
+        for x in 0..width as usize {
+            let sx = (x * color.width as usize / width as usize).min(color.width as usize - 1);
+            let src = (sy * color.width as usize + sx) * 3;
+            let dst = (y * width as usize + x) * 3;
+            rgb[dst] = color.rgb[src];
+            rgb[dst + 1] = color.rgb[src + 1];
+            rgb[dst + 2] = color.rgb[src + 2];
+        }
+    }
+
+    encode_rgb_jpeg(width, height, &rgb)
+}
+
 fn encode_depth_z16_png(depth: &DepthFrame) -> Result<Vec<u8>, String> {
     let mut be = Vec::with_capacity(depth.z16.len() * 2);
     for value in &depth.z16 {
@@ -300,7 +358,7 @@ fn encode_depth_z16_png(depth: &DepthFrame) -> Result<Vec<u8>, String> {
 
     let mut bytes = Vec::new();
     {
-        let mut encoder = Encoder::new(&mut bytes, depth.width, depth.height);
+        let mut encoder = PngEncoder::new(&mut bytes, depth.width, depth.height);
         encoder.set_color(ColorType::Grayscale);
         encoder.set_depth(BitDepth::Sixteen);
         let mut writer = encoder
@@ -313,35 +371,56 @@ fn encode_depth_z16_png(depth: &DepthFrame) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn encode_depth_preview_png(
+fn encode_depth_preview_jpeg(
     depth: &DepthFrame,
     config: &ResolvedCaptureConfig,
 ) -> Result<Vec<u8>, String> {
-    let mut rgb = vec![0u8; (depth.width * depth.height * 3) as usize];
+    let (width, height) = preview_dimensions(depth.width, depth.height);
+    let mut rgb = vec![0u8; (width * height * 3) as usize];
     let range = (config.max_depth_m - config.min_depth_m).max(0.01);
 
-    for (idx, value) in depth.z16.iter().enumerate() {
-        let meters = *value as f32 * depth.units_m;
-        let rgb_idx = idx * 3;
-        if *value == 0 || meters < config.min_depth_m || meters > config.max_depth_m {
-            rgb[rgb_idx] = 18;
-            rgb[rgb_idx + 1] = 22;
-            rgb[rgb_idx + 2] = 24;
-            continue;
-        }
+    for y in 0..height as usize {
+        let sy = (y * depth.height as usize / height as usize).min(depth.height as usize - 1);
+        for x in 0..width as usize {
+            let sx = (x * depth.width as usize / width as usize).min(depth.width as usize - 1);
+            let value = depth.z16[sy * depth.width as usize + sx];
+            let meters = value as f32 * depth.units_m;
+            let rgb_idx = (y * width as usize + x) * 3;
+            if value == 0 || meters < config.min_depth_m || meters > config.max_depth_m {
+                rgb[rgb_idx] = 18;
+                rgb[rgb_idx + 1] = 22;
+                rgb[rgb_idx + 2] = 24;
+                continue;
+            }
 
-        let t = ((meters - config.min_depth_m) / range).clamp(0.0, 1.0);
-        let near = 1.0 - t;
-        rgb[rgb_idx] = (42.0 + 210.0 * near) as u8;
-        rgb[rgb_idx + 1] = (84.0 + 120.0 * (1.0 - (t - 0.45).abs() * 1.7).max(0.0)) as u8;
-        rgb[rgb_idx + 2] = (114.0 + 112.0 * t) as u8;
+            let t = ((meters - config.min_depth_m) / range).clamp(0.0, 1.0);
+            let near = 1.0 - t;
+            rgb[rgb_idx] = (42.0 + 210.0 * near) as u8;
+            rgb[rgb_idx + 1] = (84.0 + 120.0 * (1.0 - (t - 0.45).abs() * 1.7).max(0.0)) as u8;
+            rgb[rgb_idx + 2] = (114.0 + 112.0 * t) as u8;
+        }
     }
 
-    encode_rgb_png(&ColorFrame {
-        width: depth.width,
-        height: depth.height,
-        rgb,
-    })
+    encode_rgb_jpeg(width, height, &rgb)
+}
+
+fn encode_rgb_jpeg(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let encoder = JpegEncoder::new(&mut bytes, PREVIEW_JPEG_QUALITY);
+    encoder
+        .encode(rgb, width as u16, height as u16, JpegColorType::Rgb)
+        .map_err(|error| format!("failed to encode preview JPEG: {error}"))?;
+    Ok(bytes)
+}
+
+fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
+    let scale = (PREVIEW_MAX_WIDTH as f32 / width.max(1) as f32)
+        .min(PREVIEW_MAX_HEIGHT as f32 / height.max(1) as f32)
+        .min(1.0);
+    (
+        (width as f32 * scale).round().max(1.0) as u32,
+        (height as f32 * scale).round().max(1.0) as u32,
+    )
 }
 
 fn depth_stats(depth: &DepthFrame, config: &ResolvedCaptureConfig) -> DepthStats {
@@ -372,6 +451,52 @@ fn depth_stats(depth: &DepthFrame, config: &ResolvedCaptureConfig) -> DepthStats
 
     DepthStats {
         valid_points: valid,
+        min_m,
+        max_m,
+        mean_m: (sum / valid as f64) as f32,
+    }
+}
+
+fn preview_depth_stats(depth: &DepthFrame, config: &ResolvedCaptureConfig) -> DepthStats {
+    let sample_step = ((depth.width.max(depth.height) as f32 / 320.0).ceil() as usize).max(1);
+    if sample_step == 1 {
+        return depth_stats(depth, config);
+    }
+
+    let mut sampled = 0usize;
+    let mut valid = 0usize;
+    let mut min_m = f32::MAX;
+    let mut max_m = 0.0f32;
+    let mut sum = 0.0f64;
+
+    for y in (0..depth.height as usize).step_by(sample_step) {
+        for x in (0..depth.width as usize).step_by(sample_step) {
+            sampled += 1;
+            let value = depth.z16[y * depth.width as usize + x];
+            let meters = value as f32 * depth.units_m;
+            if value == 0 || meters < config.min_depth_m || meters > config.max_depth_m {
+                continue;
+            }
+            valid += 1;
+            min_m = min_m.min(meters);
+            max_m = max_m.max(meters);
+            sum += meters as f64;
+        }
+    }
+
+    if valid == 0 || sampled == 0 {
+        return DepthStats {
+            valid_points: 0,
+            min_m: 0.0,
+            max_m: 0.0,
+            mean_m: 0.0,
+        };
+    }
+
+    let total_pixels = (depth.width as usize).saturating_mul(depth.height as usize);
+    let estimated_valid = ((valid as f64 / sampled as f64) * total_pixels as f64).round() as usize;
+    DepthStats {
+        valid_points: estimated_valid,
         min_m,
         max_m,
         mean_m: (sum / valid as f64) as f32,
@@ -477,9 +602,7 @@ fn sample_color(
 }
 
 fn data_url(mime: &str, data: &[u8]) -> String {
-    format!("{mime};base64,{}", general_purpose::STANDARD.encode(data))
-        .replacen(';', ";", 1)
-        .replacen("image/png;", "data:image/png;", 1)
+    format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(data))
 }
 
 fn path_string(path: &PathBuf) -> String {

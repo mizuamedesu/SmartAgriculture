@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "web-preview": "node web-preview/server.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

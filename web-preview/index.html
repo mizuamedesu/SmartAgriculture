@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tomato Twin Web Preview</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f7f4;
+        --panel: #ffffff;
+        --panel-soft: #fafafa;
+        --text: #18181b;
+        --muted: #71717a;
+        --border: #deded8;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --warn: #b45309;
+        --danger: #b91c1c;
+        --shadow: 0 18px 50px rgba(24, 24, 27, 0.08);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(247, 247, 244, 0.92)),
+          var(--bg);
+        color: var(--text);
+      }
+
+      button,
+      select {
+        font: inherit;
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        gap: 16px;
+        padding: 18px;
+      }
+
+      .topbar,
+      .toolbar,
+      .metrics {
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.86);
+        backdrop-filter: blur(10px);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+      }
+
+      .topbar {
+        min-height: 74px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 14px 16px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(20px, 2.2vw, 30px);
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        margin: 7px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status-row {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .badge {
+        min-height: 30px;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 4px 10px;
+        background: var(--panel-soft);
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #a1a1aa;
+      }
+
+      .badge.live .dot {
+        background: #16a34a;
+        box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.14);
+      }
+
+      .badge.loading .dot {
+        background: var(--warn);
+        box-shadow: 0 0 0 4px rgba(180, 83, 9, 0.12);
+      }
+
+      .badge.error .dot {
+        background: var(--danger);
+        box-shadow: 0 0 0 4px rgba(185, 28, 28, 0.12);
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px;
+        flex-wrap: wrap;
+      }
+
+      .field {
+        display: grid;
+        gap: 5px;
+        min-width: min(100%, 230px);
+      }
+
+      label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      select {
+        height: 40px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--text);
+        padding: 0 12px;
+        outline: none;
+      }
+
+      select:focus-visible,
+      button:focus-visible {
+        outline: 2px solid rgba(15, 118, 110, 0.38);
+        outline-offset: 2px;
+      }
+
+      button {
+        height: 40px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 0 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        background: var(--accent);
+        color: white;
+        cursor: pointer;
+        transition:
+          background 0.15s ease,
+          transform 0.15s ease,
+          border-color 0.15s ease;
+      }
+
+      button:hover {
+        background: var(--accent-strong);
+      }
+
+      button:active {
+        transform: translateY(1px);
+      }
+
+      button.secondary {
+        background: var(--panel);
+        color: var(--text);
+        border-color: var(--border);
+      }
+
+      button.secondary:hover {
+        background: #f0f0ec;
+      }
+
+      button:disabled {
+        opacity: 0.58;
+        cursor: wait;
+      }
+
+      .loader {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        color: var(--warn);
+        font-size: 13px;
+        margin-left: auto;
+      }
+
+      .loader[hidden] {
+        display: none;
+      }
+
+      .spinner {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid rgba(180, 83, 9, 0.2);
+        border-top-color: var(--warn);
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .preview-grid {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .pane {
+        min-height: 320px;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }
+
+      .pane-head {
+        min-height: 46px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+        background: #fbfbf8;
+      }
+
+      .pane-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        background: linear-gradient(135deg, #ef4444, #22c55e 48%, #2563eb);
+      }
+
+      .swatch.depth {
+        background: linear-gradient(135deg, #1d4ed8, #06b6d4 45%, #f97316);
+      }
+
+      .pane-state {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .media {
+        min-width: 0;
+        min-height: 0;
+        position: relative;
+        display: grid;
+        place-items: center;
+        background:
+          linear-gradient(45deg, rgba(0, 0, 0, 0.035) 25%, transparent 25%),
+          linear-gradient(-45deg, rgba(0, 0, 0, 0.035) 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, rgba(0, 0, 0, 0.035) 75%),
+          linear-gradient(-45deg, transparent 75%, rgba(0, 0, 0, 0.035) 75%);
+        background-size: 26px 26px;
+        background-position:
+          0 0,
+          0 13px,
+          13px -13px,
+          -13px 0;
+      }
+
+      .media img {
+        width: 100%;
+        height: 100%;
+        display: none;
+        object-fit: contain;
+        background: #111;
+      }
+
+      .media img.ready {
+        display: block;
+      }
+
+      .placeholder,
+      .overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        text-align: center;
+        padding: 18px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .overlay {
+        background: rgba(255, 255, 255, 0.84);
+        color: var(--warn);
+        font-weight: 600;
+      }
+
+      .overlay[hidden] {
+        display: none;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(120px, 1fr));
+        gap: 1px;
+        overflow: hidden;
+      }
+
+      .metric {
+        min-height: 64px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.92);
+      }
+
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+
+      .metric strong {
+        display: block;
+        font-size: 18px;
+        line-height: 1.1;
+        font-weight: 720;
+        overflow-wrap: anywhere;
+      }
+
+      .error-box {
+        min-height: 24px;
+        color: var(--danger);
+        font-size: 13px;
+        white-space: pre-wrap;
+      }
+
+      .error-box:empty {
+        display: none;
+      }
+
+      @media (max-width: 920px) {
+        .app {
+          padding: 12px;
+        }
+
+        .topbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .status-row {
+          justify-content: flex-start;
+        }
+
+        .preview-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .pane {
+          min-height: 270px;
+        }
+
+        .metrics {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .loader {
+          width: 100%;
+          margin-left: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <h1>Tomato Twin Web Preview</h1>
+          <p class="subtitle">Intel RealSense RGB-D capture monitor</p>
+        </div>
+        <div class="status-row">
+          <span class="badge" id="liveBadge"><span class="dot"></span><span id="liveText">No frame</span></span>
+          <span class="badge" id="helperBadge"><span class="dot"></span><span id="helperText">Helper idle</span></span>
+          <span class="badge"><span class="dot"></span><span id="sessionText">Session -</span></span>
+        </div>
+      </header>
+
+      <section class="toolbar">
+        <div class="field">
+          <label for="profile">Capture profile</label>
+          <select id="profile">
+            <option value="1280x720@30" selected>1280 x 720 / 30 FPS</option>
+            <option value="848x480@30">848 x 480 / 30 FPS</option>
+            <option value="640x480@30">640 x 480 / 30 FPS</option>
+            <option value="424x240@30">424 x 240 / 30 FPS</option>
+            <option value="320x240@30">320 x 240 / 30 FPS</option>
+          </select>
+        </div>
+        <button id="startBtn" type="button">Start Preview</button>
+        <button id="stopBtn" class="secondary" type="button">Stop</button>
+        <span class="loader" id="loader" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="loaderText">Loading</span>
+        </span>
+      </section>
+
+      <section class="preview-grid">
+        <article class="pane">
+          <div class="pane-head">
+            <div class="pane-title"><span class="swatch"></span>RGB</div>
+            <div class="pane-state" id="rgbState">waiting</div>
+          </div>
+          <div class="media">
+            <img id="rgbImg" alt="RGB preview" />
+            <div class="placeholder" id="rgbPlaceholder">No RGB frame</div>
+            <div class="overlay" id="rgbOverlay" hidden>Loading</div>
+          </div>
+        </article>
+
+        <article class="pane">
+          <div class="pane-head">
+            <div class="pane-title"><span class="swatch depth"></span>Depth</div>
+            <div class="pane-state" id="depthState">waiting</div>
+          </div>
+          <div class="media">
+            <img id="depthImg" alt="Depth preview" />
+            <div class="placeholder" id="depthPlaceholder">No depth frame</div>
+            <div class="overlay" id="depthOverlay" hidden>Loading</div>
+          </div>
+        </article>
+      </section>
+
+      <section class="metrics">
+        <div class="metric"><span>Preview FPS</span><strong id="fpsValue">0.0</strong></div>
+        <div class="metric"><span>Frame</span><strong id="frameValue">-</strong></div>
+        <div class="metric"><span>Valid depth</span><strong id="validValue">-</strong></div>
+        <div class="metric"><span>Mean depth</span><strong id="meanValue">-</strong></div>
+        <div class="metric"><span>Range</span><strong id="rangeValue">-</strong></div>
+        <div class="metric"><span>Latency</span><strong id="latencyValue">-</strong></div>
+      </section>
+
+      <div class="error-box" id="errorBox"></div>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const state = {
+        starting: false,
+        lastFrameIndex: null,
+        lastFrameSeenAt: 0,
+        fpsSamples: [],
+        pollBusy: false,
+        consecutiveErrors: 0
+      };
+
+      const els = {
+        profile: $("profile"),
+        startBtn: $("startBtn"),
+        stopBtn: $("stopBtn"),
+        loader: $("loader"),
+        loaderText: $("loaderText"),
+        liveBadge: $("liveBadge"),
+        liveText: $("liveText"),
+        helperBadge: $("helperBadge"),
+        helperText: $("helperText"),
+        sessionText: $("sessionText"),
+        rgbImg: $("rgbImg"),
+        depthImg: $("depthImg"),
+        rgbPlaceholder: $("rgbPlaceholder"),
+        depthPlaceholder: $("depthPlaceholder"),
+        rgbOverlay: $("rgbOverlay"),
+        depthOverlay: $("depthOverlay"),
+        rgbState: $("rgbState"),
+        depthState: $("depthState"),
+        fpsValue: $("fpsValue"),
+        frameValue: $("frameValue"),
+        validValue: $("validValue"),
+        meanValue: $("meanValue"),
+        rangeValue: $("rangeValue"),
+        latencyValue: $("latencyValue"),
+        errorBox: $("errorBox")
+      };
+
+      els.startBtn.addEventListener("click", startPreview);
+      els.stopBtn.addEventListener("click", stopPreview);
+
+      window.addEventListener("load", () => {
+        refreshStatus();
+        pollLoop();
+        setInterval(refreshStatus, 2000);
+      });
+
+      async function startPreview() {
+        const profile = parseProfile(els.profile.value);
+        setError("");
+        setStarting(true, "Loading: starting RealSense helper");
+        setLiveStatus("loading", "Starting");
+        try {
+          await fetchJson("/api/start-preview", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(profile),
+            timeout: 45000
+          });
+          resetFps();
+          setStarting(true, "Loading: waiting for RGB-D frames");
+          await refreshStatus();
+        } catch (error) {
+          setStarting(false);
+          setLiveStatus("error", "Start failed");
+          setError(String(error.message || error));
+        }
+      }
+
+      async function stopPreview() {
+        setError("");
+        setStarting(true, "Loading: stopping RealSense helper");
+        try {
+          await fetchJson("/api/stop-preview", { method: "POST", timeout: 25000 });
+          state.lastFrameIndex = null;
+          resetFps();
+          clearImages();
+          setStarting(false);
+          setLiveStatus("", "Stopped");
+          await refreshStatus();
+        } catch (error) {
+          setStarting(false);
+          setLiveStatus("error", "Stop failed");
+          setError(String(error.message || error));
+        }
+      }
+
+      async function pollLoop() {
+        if (!state.pollBusy) {
+          state.pollBusy = true;
+          try {
+            await pollFrame();
+          } finally {
+            state.pollBusy = false;
+          }
+        }
+        setTimeout(pollLoop, 33);
+      }
+
+      async function pollFrame() {
+        try {
+          const frame = await fetchJson(`/api/frame?ts=${Date.now()}`, { timeout: 3000 });
+          state.consecutiveErrors = 0;
+          renderFrame(frame);
+        } catch (error) {
+          state.consecutiveErrors += 1;
+          if (state.starting) {
+            setLiveStatus("loading", "Waiting for frames");
+            setOverlays("Loading: waiting for RGB-D frames");
+          } else if (state.consecutiveErrors > 8) {
+            setLiveStatus("", "No frame");
+          }
+        }
+      }
+
+      function renderFrame(frame) {
+        const color = frame.colorPreviewDataUrl || "";
+        const depth = frame.depthPreviewDataUrl || "";
+        const frameIndex = frame.frameIndex ?? frame.frameNumber ?? "-";
+        const changed = state.lastFrameIndex !== frameIndex;
+
+        if (color.startsWith("data:image/")) {
+          els.rgbImg.src = color;
+          els.rgbImg.classList.add("ready");
+          els.rgbPlaceholder.style.display = "none";
+          els.rgbState.textContent = "live";
+        }
+
+        if (depth.startsWith("data:image/")) {
+          els.depthImg.src = depth;
+          els.depthImg.classList.add("ready");
+          els.depthPlaceholder.style.display = "none";
+          els.depthState.textContent = "live";
+        }
+
+        if (changed) {
+          updateFps();
+          state.lastFrameIndex = frameIndex;
+          state.lastFrameSeenAt = performance.now();
+        }
+
+        const depthStats = frame.depth || {};
+        const minM = finiteNumber(depthStats.minM);
+        const maxM = finiteNumber(depthStats.maxM);
+        const meanM = finiteNumber(depthStats.meanM);
+
+        els.frameValue.textContent = String(frameIndex);
+        els.validValue.textContent = formatInt(depthStats.validPoints);
+        els.meanValue.textContent = meanM == null ? "-" : `${(meanM * 1000).toFixed(0)} mm`;
+        els.rangeValue.textContent =
+          minM == null || maxM == null
+            ? "-"
+            : `${(minM * 1000).toFixed(0)}-${(maxM * 1000).toFixed(0)} mm`;
+        els.latencyValue.textContent = formatLatency(frame.timestampMs);
+        els.sessionText.textContent = `Session ${frame.sessionId || "-"}`;
+
+        setStarting(false);
+        setOverlays("");
+        setLiveStatus("live", `Live ${els.fpsValue.textContent} FPS`);
+        setError("");
+      }
+
+      async function refreshStatus() {
+        try {
+          const status = await fetchJson("/api/status", { timeout: 3000 });
+          const pids = status.helperPids || [];
+          els.helperText.textContent = pids.length ? `Helper PID ${pids.join(", ")}` : "Helper idle";
+          els.helperBadge.className = pids.length ? "badge live" : "badge";
+          if (status.currentSession?.sessionId) {
+            els.sessionText.textContent = `Session ${status.currentSession.sessionId}`;
+          }
+        } catch {
+          els.helperText.textContent = "Status error";
+          els.helperBadge.className = "badge error";
+        }
+      }
+
+      function setStarting(value, text = "Loading") {
+        state.starting = value;
+        els.startBtn.disabled = value;
+        els.stopBtn.disabled = value && text.includes("stopping");
+        els.loader.hidden = !value;
+        els.loaderText.textContent = text;
+        setOverlays(value ? text : "");
+      }
+
+      function setOverlays(text) {
+        for (const overlay of [els.rgbOverlay, els.depthOverlay]) {
+          overlay.hidden = !text;
+          overlay.textContent = text || "";
+        }
+      }
+
+      function setLiveStatus(kind, text) {
+        els.liveBadge.className = kind ? `badge ${kind}` : "badge";
+        els.liveText.textContent = text;
+      }
+
+      function setError(text) {
+        els.errorBox.textContent = text || "";
+      }
+
+      function clearImages() {
+        for (const [img, placeholder, paneState] of [
+          [els.rgbImg, els.rgbPlaceholder, els.rgbState],
+          [els.depthImg, els.depthPlaceholder, els.depthState]
+        ]) {
+          img.removeAttribute("src");
+          img.classList.remove("ready");
+          placeholder.style.display = "";
+          paneState.textContent = "waiting";
+        }
+        els.frameValue.textContent = "-";
+        els.validValue.textContent = "-";
+        els.meanValue.textContent = "-";
+        els.rangeValue.textContent = "-";
+        els.latencyValue.textContent = "-";
+      }
+
+      function updateFps() {
+        const now = performance.now();
+        if (state.lastFrameSeenAt) {
+          const delta = now - state.lastFrameSeenAt;
+          if (delta > 0) {
+            state.fpsSamples.push(1000 / delta);
+            if (state.fpsSamples.length > 24) state.fpsSamples.shift();
+          }
+        }
+        const fps =
+          state.fpsSamples.reduce((sum, value) => sum + value, 0) /
+          Math.max(1, state.fpsSamples.length);
+        els.fpsValue.textContent = fps.toFixed(1);
+      }
+
+      function resetFps() {
+        state.lastFrameSeenAt = 0;
+        state.fpsSamples = [];
+        els.fpsValue.textContent = "0.0";
+      }
+
+      function parseProfile(value) {
+        const match = /^(\d+)x(\d+)@(\d+)$/.exec(value);
+        return {
+          width: Number(match?.[1] || 1280),
+          height: Number(match?.[2] || 720),
+          fps: Number(match?.[3] || 30)
+        };
+      }
+
+      async function fetchJson(url, options = {}) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), options.timeout || 8000);
+        try {
+          const response = await fetch(url, { ...options, signal: controller.signal });
+          const text = await response.text();
+          const json = text ? JSON.parse(text) : {};
+          if (!response.ok || json.ok === false) {
+            throw new Error(json.error || `${response.status} ${response.statusText}`);
+          }
+          return json;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function finiteNumber(value) {
+        return Number.isFinite(value) ? value : null;
+      }
+
+      function formatInt(value) {
+        return Number.isFinite(value) ? new Intl.NumberFormat("en-US").format(value) : "-";
+      }
+
+      function formatLatency(timestampMs) {
+        if (!Number.isFinite(timestampMs)) return "-";
+        const diff = Math.max(0, Date.now() - timestampMs);
+        if (diff < 1000) return `${diff.toFixed(0)} ms`;
+        return `${(diff / 1000).toFixed(1)} s`;
+      }
+    </script>
+  </body>
+</html>

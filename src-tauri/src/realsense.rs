@@ -496,6 +496,23 @@ pub fn ensure_realsense_sdk() -> Result<SdkSetupResult, String> {
                 Err(error) => log.push(format!("camera daemon reset skipped: {error}")),
             }
         }
+
+        if let Some(owner) = detect_uvc_assistant_owner() {
+            log.push(format!("macOS UVCAssistant owns RealSense interfaces: {owner}"));
+            if let Some(osascript) = find_executable("osascript") {
+                let script = "do shell script \"launchctl disable system/com.apple.cmio.registerassistantservice; launchctl disable system/com.apple.cmio.uvcassistantextension; launchctl disable system/com.apple.cmio.VDCAssistant; launchctl disable system/com.apple.cameracaptured; launchctl disable system/com.apple.appleh16camerad; killall -9 com.apple.cmio.registerassistantservice UVCAssistant VDCAssistant cameracaptured appleh16camerad AppleCameraAssistant 2>/dev/null || true\" with administrator privileges";
+                match run_command(&osascript, &["-e", script]) {
+                    Ok(output) => {
+                        log.push(format!("disabled Apple UVC helper: {}", output.summary()));
+                        log.push(
+                            "Unplug and reconnect the D435i; if UVCAssistant still owns it, restart macOS once and rerun Setup SDK."
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => log.push(format!("Apple UVC helper disable skipped: {error}")),
+                }
+            }
+        }
     }
 
     let rs_enumerate = find_executable("rs-enumerate-devices");
@@ -1150,11 +1167,51 @@ fn usb_diagnostic_status(devices: &[UsbRealSenseDevice]) -> (String, Option<Stri
             format!("RealSense USB device detected, but not at USB3 speed: {summaries}"),
             Some("The D435i is connected, but the current USB link is below 5 Gbps. Use a short USB3/USB-C data cable, flip/reseat both ends, or try another Mac port; RGB-D streaming cannot open reliably at USB2 speed.".to_string()),
         )
+    } else if let Some(owner) = detect_uvc_assistant_owner() {
+        (
+            format!("RealSense is on USB3, but macOS UVCAssistant is claiming it: {owner}"),
+            Some("Run Setup SDK, approve the administrator prompt, then unplug and reconnect the D435i. If UVCAssistant still appears as owner, restart macOS once; the helper has been disabled for the next boot.".to_string()),
+        )
     } else {
         (
             format!("{} RealSense USB device(s) detected, but SDK could not open them", devices.len()),
             Some("Close camera apps, run Setup SDK, then reconnect the camera if the SDK still cannot claim the interface.".to_string()),
         )
+    }
+}
+
+fn detect_uvc_assistant_owner() -> Option<String> {
+    let ioreg = PathBuf::from("/usr/sbin/ioreg");
+    let output = run_command(
+        &ioreg,
+        &["-r", "-c", "IOUSBHostInterface", "-l", "-w", "0"],
+    )
+    .ok()?;
+    if !output.status_success {
+        return None;
+    }
+
+    let mut in_realsense_interface = false;
+    let mut owners = Vec::new();
+
+    for line in output.stdout.lines() {
+        if line.contains("+-o ") {
+            in_realsense_interface = line.to_ascii_lowercase().contains("realsense");
+        }
+
+        if in_realsense_interface && line.contains("\"UsbExclusiveOwner\"") {
+            if let Some(owner) = parse_ioreg_string(line) {
+                if owner.contains("UVCAssistant") && !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+        }
+    }
+
+    if owners.is_empty() {
+        None
+    } else {
+        Some(owners.join(", "))
     }
 }
 

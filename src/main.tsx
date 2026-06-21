@@ -7,6 +7,7 @@ import {
   Cpu,
   Download,
   FolderOpen,
+  Loader2,
   Radio,
   RefreshCw,
   ScanLine,
@@ -18,7 +19,7 @@ import { createRoot } from "react-dom/client";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
-import { Input, Label, Textarea } from "./components/ui/form";
+import { Input, Label, Select, Textarea } from "./components/ui/form";
 import { cn } from "./lib/utils";
 import "./styles.css";
 
@@ -87,6 +88,19 @@ interface SessionStarted {
 
 interface SessionStopped {
   framesWritten: number;
+}
+
+interface PrivilegedPreviewStarted {
+  sessionId: string;
+  framePath: string;
+  pidPath: string;
+  logPath: string;
+  launchMode: string;
+}
+
+interface InstalledHelper {
+  path: string;
+  status: string;
 }
 
 interface DepthStats {
@@ -160,14 +174,22 @@ interface AssetBuildResult {
 }
 
 const isTauri = Boolean((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+const CAPTURE_PROFILES = [
+  { label: "1280 x 720 / 30 fps", width: 1280, height: 720, fps: 30 },
+  { label: "848 x 480 / 30 fps", width: 848, height: 480, fps: 30 },
+  { label: "640 x 480 / 30 fps", width: 640, height: 480, fps: 30 },
+  { label: "640 x 480 / 15 fps", width: 640, height: 480, fps: 15 },
+  { label: "424 x 240 / 30 fps", width: 424, height: 240, fps: 30 },
+  { label: "320 x 240 / 30 fps", width: 320, height: 240, fps: 30 }
+] as const;
 
 function App() {
   const [probe, setProbe] = useState<RuntimeProbe | null>(null);
   const [config, setConfig] = useState<CaptureConfig>({
-    width: 640,
-    height: 480,
-    fps: 6,
-    backend: "auto",
+    width: 1280,
+    height: 720,
+    fps: 30,
+    backend: "realsense",
     targetLabel: "mini_tomato",
     cultivar: "",
     notes: "",
@@ -185,18 +207,51 @@ function App() {
     exportFbx: true
   });
   const [recording, setRecording] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [activeSession, setActiveSession] = useState<SessionStarted | null>(null);
+  const [previewSession, setPreviewSession] = useState<SessionStarted | null>(null);
+  const [privilegedPreview, setPrivilegedPreview] = useState<PrivilegedPreviewStarted | null>(null);
   const [latestFrame, setLatestFrame] = useState<FrameSummary | null>(null);
   const [assetTools, setAssetTools] = useState<AssetTools | null>(null);
   const [assetResult, setAssetResult] = useState<AssetBuildResult | null>(null);
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [captureStarting, setCaptureStarting] = useState(false);
+  const [captureStopping, setCaptureStopping] = useState(false);
   const [assetBusy, setAssetBusy] = useState(false);
   const [sdkSetupBusy, setSdkSetupBusy] = useState(false);
+  const [helperInstallBusy, setHelperInstallBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const mockTimer = useRef<number | null>(null);
+  const privilegedPollTimer = useRef<number | null>(null);
+  const latestFrameAttachTimer = useRef<number | null>(null);
+  const previewTimeoutTimer = useRef<number | null>(null);
+  const previewRequestId = useRef(0);
+  const privilegedReadBusy = useRef(false);
+  const privilegedPreviewRef = useRef<PrivilegedPreviewStarted | null>(null);
   const autoSetupAttempted = useRef(false);
 
   const devices = probe?.devices ?? [];
-  const backend = activeSession?.backend ?? config.backend;
+  const backend = activeSession?.backend ?? previewSession?.backend ?? config.backend;
+  const busyMessage = captureStopping
+    ? "Loading: stopping recording"
+    : captureStarting
+      ? "Loading: starting RGB-D recording"
+      : previewLoading
+        ? "Loading: opening RealSense preview"
+        : sdkSetupBusy
+          ? "Loading: checking SDK"
+          : helperInstallBusy
+            ? "Loading: installing helper"
+            : assetBusy
+              ? "Loading: generating 3D assets"
+              : probeBusy
+                ? "Loading: refreshing devices"
+                : null;
+
+  useEffect(() => {
+    privilegedPreviewRef.current = privilegedPreview;
+  }, [privilegedPreview]);
 
   const pushLog = (message: string) => {
     const stamp = new Date().toLocaleTimeString("ja-JP", { hour12: false });
@@ -204,6 +259,7 @@ function App() {
   };
 
   const refreshProbe = async (options?: { autoSetup?: boolean }) => {
+    setProbeBusy(true);
     try {
       const runtime = await tauriCall<RuntimeProbe>("probe_runtime");
       const tools = await tauriCall<AssetTools>("detect_asset_tools");
@@ -217,6 +273,8 @@ function App() {
       }
     } catch (error) {
       pushLog(`probe failed: ${String(error)}`);
+    } finally {
+      setProbeBusy(false);
     }
   };
 
@@ -238,8 +296,26 @@ function App() {
     }
   };
 
-  const startCapture = async () => {
+  const installHelper = async () => {
+    setHelperInstallBusy(true);
+    pushLog("installing no-sudo RealSense helper");
     try {
+      const result = await tauriCall<InstalledHelper>("install_privileged_helper");
+      pushLog(result.status);
+      pushLog(result.path);
+    } catch (error) {
+      pushLog(`helper install failed: ${String(error)}`);
+    } finally {
+      setHelperInstallBusy(false);
+    }
+  };
+
+  const startCapture = async () => {
+    setCaptureStarting(true);
+    try {
+      if (previewing) {
+        await stopPreview();
+      }
       const wantsRealSense = config.backend === "auto" || config.backend === "realsense";
       if (wantsRealSense && !probe?.sdkLoaded) {
         await setupSdk();
@@ -247,7 +323,9 @@ function App() {
 
       const session = await tauriCall<SessionStarted>("start_recording", { config });
       setRecording(true);
+      setPreviewing(false);
       setActiveSession(session);
+      setPreviewSession(null);
       setLatestFrame(null);
       setAssetResult(null);
       pushLog(`started ${session.backend}: ${session.sessionId}`);
@@ -255,10 +333,219 @@ function App() {
       if (!isTauri) startMockFrames(session, config, mockTimer, setLatestFrame);
     } catch (error) {
       pushLog(`start failed: ${String(error)}`);
+    } finally {
+      setCaptureStarting(false);
+    }
+  };
+
+  const stopPrivilegedPolling = () => {
+    if (privilegedPollTimer.current !== null) {
+      window.clearInterval(privilegedPollTimer.current);
+      privilegedPollTimer.current = null;
+    }
+    privilegedReadBusy.current = false;
+  };
+
+  const stopLatestFrameAttach = () => {
+    if (latestFrameAttachTimer.current !== null) {
+      window.clearInterval(latestFrameAttachTimer.current);
+      latestFrameAttachTimer.current = null;
+    }
+  };
+
+  const clearPreviewTimeout = () => {
+    if (previewTimeoutTimer.current !== null) {
+      window.clearTimeout(previewTimeoutTimer.current);
+      previewTimeoutTimer.current = null;
+    }
+  };
+
+  const failPreviewStartup = (requestId: number, message: string) => {
+    if (requestId !== previewRequestId.current) return;
+    previewRequestId.current += 1;
+    clearPreviewTimeout();
+    stopMockFrames(mockTimer);
+    stopPrivilegedPolling();
+    stopLatestFrameAttach();
+    setPreviewing(false);
+    setPreviewLoading(false);
+    setPreviewSession(null);
+    setPrivilegedPreview(null);
+    pushLog(message);
+  };
+
+  const readPreviewFrame = async (framePath: string) => {
+    try {
+      return await tauriCall<FrameSummary>("read_privileged_preview_frame", { framePath });
+    } catch {
+      return tauriCall<FrameSummary>("read_latest_privileged_preview_frame");
+    }
+  };
+
+  const startLatestFrameAttach = () => {
+    stopLatestFrameAttach();
+    latestFrameAttachTimer.current = window.setInterval(async () => {
+      try {
+        const frame = await tauriCall<FrameSummary>("read_latest_privileged_preview_frame");
+        clearPreviewTimeout();
+        setLatestFrame(frame);
+        setPreviewLoading(false);
+        setPreviewing(true);
+        setPreviewSession((current) =>
+          current ?? {
+            sessionId: frame.sessionId,
+            root: "",
+            backend: "realsense",
+            notice: null
+          }
+        );
+      } catch {
+        // Opportunistic attach loop; normal timeout and log path handle failures.
+      }
+    }, 150);
+  };
+
+  const startPrivilegedPolling = (framePath: string) => {
+    stopPrivilegedPolling();
+    startLatestFrameAttach();
+    let misses = 0;
+    privilegedPollTimer.current = window.setInterval(async () => {
+      if (privilegedReadBusy.current) return;
+      privilegedReadBusy.current = true;
+      try {
+        const frame = await readPreviewFrame(framePath);
+        misses = 0;
+        clearPreviewTimeout();
+        setLatestFrame(frame);
+        setPreviewLoading(false);
+      } catch {
+        misses += 1;
+        if (misses === 30) {
+          pushLog("waiting for RealSense frames from helper");
+        }
+      } finally {
+        privilegedReadBusy.current = false;
+      }
+    }, Math.max(16, Math.round(1000 / Math.max(1, config.fps))));
+  };
+
+  const startPreview = async () => {
+    const requestId = previewRequestId.current + 1;
+    previewRequestId.current = requestId;
+    clearPreviewTimeout();
+    previewTimeoutTimer.current = window.setTimeout(() => {
+      failPreviewStartup(
+        requestId,
+        "RealSense preview timed out: helper opened but no RGB-D frame arrived. Old helpers were cleaned on next start; unplug/replug the camera if this repeats."
+      );
+    }, 20_000);
+
+    try {
+      stopMockFrames(mockTimer);
+      stopPrivilegedPolling();
+      stopLatestFrameAttach();
+      setPreviewing(true);
+      setPreviewLoading(true);
+      setActiveSession(null);
+      setLatestFrame(null);
+      setAssetResult(null);
+      setPrivilegedPreview(null);
+
+      if (!isTauri) {
+        const session = {
+          sessionId: `browser_preview_${Date.now()}`,
+          root: "",
+          backend: "synthetic",
+          notice: "Browser preview mode"
+        };
+        setPreviewSession(session);
+        startMockFrames(session, config, mockTimer, setLatestFrame);
+        clearPreviewTimeout();
+        setPreviewLoading(false);
+        pushLog("browser demo preview started");
+        return;
+      }
+
+      if (config.backend === "synthetic") {
+        const session = await tauriCall<SessionStarted>("start_preview", { config });
+        setPreviewSession(session);
+        clearPreviewTimeout();
+        setPreviewLoading(false);
+        pushLog(`demo preview: ${session.sessionId}`);
+        if (session.notice) pushLog(session.notice);
+        return;
+      }
+
+      if (!probe?.sdkLoaded) {
+        await setupSdk();
+      }
+
+      pushLog("starting RealSense preview helper");
+      const started = await tauriCall<PrivilegedPreviewStarted>("start_privileged_preview", {
+        config: { ...config, backend: "realsense" }
+      });
+      if (requestId !== previewRequestId.current) return;
+      setPrivilegedPreview(started);
+      setPreviewSession({
+        sessionId: started.sessionId,
+        root: "",
+        backend: "realsense",
+        notice: null
+      });
+      startPrivilegedPolling(started.framePath);
+      try {
+        const firstFrame = await readPreviewFrame(started.framePath);
+        if (requestId === previewRequestId.current) {
+          clearPreviewTimeout();
+          setLatestFrame(firstFrame);
+          setPreviewLoading(false);
+          pushLog(`RealSense frame received: ${firstFrame.frameIndex}`);
+        }
+      } catch {
+        pushLog("RealSense helper started; waiting for first frame");
+      }
+      pushLog(`RealSense preview helper started: ${started.launchMode}`);
+    } catch (error) {
+      clearPreviewTimeout();
+      setPreviewing(false);
+      setPreviewLoading(false);
+      setPreviewSession(null);
+      setPrivilegedPreview(null);
+      pushLog(`RealSense preview failed: ${String(error)}`);
+    }
+  };
+
+  const stopPreview = async () => {
+    previewRequestId.current += 1;
+    clearPreviewTimeout();
+    stopMockFrames(mockTimer);
+    stopPrivilegedPolling();
+    stopLatestFrameAttach();
+    setPreviewLoading(false);
+    try {
+      if (isTauri && privilegedPreview) {
+        await tauriCall<void>("stop_privileged_preview", {
+          pidPath: privilegedPreview.pidPath,
+          launchMode: privilegedPreview.launchMode
+        });
+        pushLog("RealSense preview helper stopped");
+      } else if (isTauri) {
+        const stopped = await tauriCall<SessionStopped>("stop_preview");
+        pushLog(`preview stopped ${stopped.framesWritten} frames`);
+      } else {
+        pushLog("browser demo preview stopped");
+      }
+    } catch (error) {
+      pushLog(`preview stop failed: ${String(error)}`);
+    } finally {
+      setPreviewing(false);
+      setPreviewSession(null);
+      setPrivilegedPreview(null);
     }
   };
 
   const stopCapture = async () => {
+    setCaptureStopping(true);
     try {
       stopMockFrames(mockTimer);
       const stopped = await tauriCall<SessionStopped>("stop_recording");
@@ -267,6 +554,8 @@ function App() {
     } catch (error) {
       setRecording(false);
       pushLog(`stop failed: ${String(error)}`);
+    } finally {
+      setCaptureStopping(false);
     }
   };
 
@@ -311,9 +600,13 @@ function App() {
     listen<CaptureEvent>("capture-progress", (event) => {
       const payload = event.payload;
       if (payload.kind === "frame" && payload.summary) {
+        stopMockFrames(mockTimer);
+        clearPreviewTimeout();
+        setPreviewLoading(false);
         setLatestFrame(payload.summary);
       } else if (payload.kind === "finished") {
         setRecording(false);
+        setPreviewing(false);
         if (payload.message) pushLog(payload.message);
       } else if (payload.kind === "error" && payload.message) {
         pushLog(payload.message);
@@ -324,7 +617,17 @@ function App() {
 
     return () => {
       unlisten?.();
+      clearPreviewTimeout();
       stopMockFrames(mockTimer);
+      stopPrivilegedPolling();
+      stopLatestFrameAttach();
+      const helper = privilegedPreviewRef.current;
+      if (helper && isTauri) {
+        void tauriCall<void>("stop_privileged_preview", {
+          pidPath: helper.pidPath,
+          launchMode: helper.launchMode
+        });
+      }
     };
   }, []);
 
@@ -354,17 +657,31 @@ function App() {
               <Camera className="h-3.5 w-3.5" />
               {devices.length ? `${devices.length} device` : "No device"}
             </Badge>
-            <Badge variant={recording ? "live" : "outline"}>
-              {recording ? <Radio className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
-              {recording ? "Recording" : "Idle"}
+            <Badge variant={recording || previewing ? "live" : "outline"}>
+              {recording || previewing ? <Radio className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
+              {recording ? "Recording" : previewing ? "Live" : "Idle"}
             </Badge>
+            {busyMessage ? (
+              <Badge variant="warning">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                {busyMessage}
+              </Badge>
+            ) : null}
           </div>
 
-          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy} title="Refresh devices">
-            <RefreshCw className={cn("h-4 w-4", sdkSetupBusy && "animate-spin")} />
+          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy || probeBusy} title="Refresh devices">
+            <RefreshCw className={cn("h-4 w-4", (sdkSetupBusy || probeBusy) && "animate-spin")} />
           </Button>
         </div>
       </header>
+      {busyMessage ? (
+        <div className="border-b bg-amber-50 px-4 py-2 text-sm font-medium text-amber-900">
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            <span>{busyMessage}</span>
+          </div>
+        </div>
+      ) : null}
 
       <main className="grid gap-4 p-4 xl:grid-cols-[340px_minmax(520px,1fr)_360px]">
         <ControlPanel
@@ -374,8 +691,15 @@ function App() {
           setAssetOptions={setAssetOptions}
           backend={backend}
           recording={recording}
+          previewing={previewing}
+          previewLoading={previewLoading}
+          captureStarting={captureStarting}
+          captureStopping={captureStopping}
           assetBusy={assetBusy}
           activeSession={activeSession}
+          previewSession={previewSession}
+          startPreview={startPreview}
+          stopPreview={stopPreview}
           startCapture={startCapture}
           stopCapture={stopCapture}
           generateAssets={generateAssets}
@@ -383,8 +707,14 @@ function App() {
         />
 
         <section className="min-h-0 space-y-4">
-          <LiveFramePanel latestFrame={latestFrame} activeSession={activeSession} />
-          <AssetPreviewPanel assetResult={assetResult} revealAssets={() => revealPath(assetResult?.root)} />
+          <LiveFramePanel
+            latestFrame={latestFrame}
+            activeSession={activeSession ?? previewSession}
+            previewing={previewing}
+            recording={recording}
+            loadingMessage={previewLoading ? busyMessage : null}
+          />
+          <AssetPreviewPanel assetResult={assetResult} assetBusy={assetBusy} revealAssets={() => revealPath(assetResult?.root)} />
         </section>
 
         <OutputPanel
@@ -395,7 +725,9 @@ function App() {
           assetResult={assetResult}
           log={log}
           setupSdk={setupSdk}
+          installHelper={installHelper}
           sdkSetupBusy={sdkSetupBusy}
+          helperInstallBusy={helperInstallBusy}
           recording={recording}
           revealSession={() => revealPath(activeSession?.root)}
         />
@@ -411,20 +743,40 @@ function ControlPanel(props: {
   setAssetOptions: React.Dispatch<React.SetStateAction<AssetOptions>>;
   backend: string;
   recording: boolean;
+  previewing: boolean;
+  previewLoading: boolean;
+  captureStarting: boolean;
+  captureStopping: boolean;
   assetBusy: boolean;
   activeSession: SessionStarted | null;
+  previewSession: SessionStarted | null;
+  startPreview: () => void;
+  stopPreview: () => void;
   startCapture: () => void;
   stopCapture: () => void;
   generateAssets: () => void;
   assetTools: AssetTools | null;
 }) {
-  const disabled = props.recording;
+  const disabled = props.recording || props.previewing || props.captureStarting || props.captureStopping;
+  const selectedProfileIndex = CAPTURE_PROFILES.findIndex(
+    (profile) => profile.width === props.config.width && profile.height === props.config.height && profile.fps === props.config.fps
+  );
+  const selectedProfileValue = selectedProfileIndex >= 0 ? String(selectedProfileIndex) : "custom";
 
   const updateConfig = <K extends keyof CaptureConfig>(key: K, value: CaptureConfig[K]) => {
     props.setConfig((current) => ({ ...current, [key]: value }));
   };
   const updateAsset = <K extends keyof AssetOptions>(key: K, value: AssetOptions[K]) => {
     props.setAssetOptions((current) => ({ ...current, [key]: value }));
+  };
+  const applyProfile = (value: string) => {
+    const profile = CAPTURE_PROFILES[Number(value)] ?? CAPTURE_PROFILES[0];
+    props.setConfig((current) => ({
+      ...current,
+      width: profile.width,
+      height: profile.height,
+      fps: profile.fps
+    }));
   };
 
   return (
@@ -435,10 +787,23 @@ function ControlPanel(props: {
             <CardTitle>Capture</CardTitle>
             <CardDescription>Backend: {props.backend}</CardDescription>
           </div>
-          <Badge variant="secondary">{props.config.width}p</Badge>
+          <Badge variant="secondary">
+            {props.config.width}x{props.config.height} / {props.config.fps}fps
+          </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-5 pt-4">
+        <Field label="Capture profile">
+          <Select value={selectedProfileValue} disabled={disabled} onChange={(event) => applyProfile(event.target.value)}>
+            {selectedProfileIndex < 0 ? <option value="custom">Custom: {props.config.width} x {props.config.height} / {props.config.fps} fps</option> : null}
+            {CAPTURE_PROFILES.map((profile, index) => (
+              <option key={`${profile.width}-${profile.height}-${profile.fps}`} value={index}>
+                {profile.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
         <Field label="Backend">
           <div className="grid grid-cols-3 rounded-md border bg-muted p-1">
             {(["auto", "realsense", "synthetic"] as BackendMode[]).map((mode) => (
@@ -459,9 +824,6 @@ function ControlPanel(props: {
         </Field>
 
         <div className="grid grid-cols-2 gap-3">
-          <NumberField label="Width" value={props.config.width} min={320} max={1280} disabled={disabled} onChange={(v) => updateConfig("width", v)} />
-          <NumberField label="Height" value={props.config.height} min={240} max={720} disabled={disabled} onChange={(v) => updateConfig("height", v)} />
-          <NumberField label="FPS" value={props.config.fps} min={1} max={30} disabled={disabled} onChange={(v) => updateConfig("fps", v)} />
           <NumberField label="PLY stride" value={props.config.pointStride} min={1} max={12} disabled={disabled} onChange={(v) => updateConfig("pointStride", v)} />
           <NumberField label="Min depth" value={props.config.minDepthM} min={0.02} max={4} step={0.01} disabled={disabled} onChange={(v) => updateConfig("minDepthM", v)} />
           <NumberField label="Max depth" value={props.config.maxDepthM} min={0.03} max={8} step={0.01} disabled={disabled} onChange={(v) => updateConfig("maxDepthM", v)} />
@@ -488,13 +850,21 @@ function ControlPanel(props: {
         </Field>
 
         <div className="grid grid-cols-2 gap-3">
-          <Button onClick={props.startCapture} disabled={props.recording}>
-            <ScanLine className="h-4 w-4" />
-            Start
+          <Button
+            variant="secondary"
+            onClick={props.previewing ? props.stopPreview : props.startPreview}
+            disabled={props.recording || props.captureStarting || props.captureStopping}
+          >
+            {props.previewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+            {props.previewLoading ? "Loading Preview" : props.previewing ? "Stop Live" : "Live Preview"}
           </Button>
-          <Button variant="destructive" onClick={props.stopCapture} disabled={!props.recording}>
-            <Square className="h-4 w-4" />
-            Stop
+          <Button onClick={props.startCapture} disabled={props.recording || props.previewing || props.captureStarting}>
+            {props.captureStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
+            {props.captureStarting ? "Loading Record" : "Record RGB-D"}
+          </Button>
+          <Button className="col-span-2" variant="destructive" onClick={props.stopCapture} disabled={!props.recording || props.captureStopping}>
+            {props.captureStopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+            {props.captureStopping ? "Loading Stop" : "Stop Recording"}
           </Button>
         </div>
 
@@ -523,7 +893,7 @@ function ControlPanel(props: {
             </label>
           </div>
           <Button className="mt-3 w-full" variant="secondary" onClick={props.generateAssets} disabled={!props.activeSession || props.recording || props.assetBusy}>
-            <Box className="h-4 w-4" />
+            {props.assetBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Box className="h-4 w-4" />}
             {props.assetBusy ? "Generating" : "Generate assets"}
           </Button>
         </div>
@@ -532,14 +902,28 @@ function ControlPanel(props: {
   );
 }
 
-function LiveFramePanel({ latestFrame, activeSession }: { latestFrame: FrameSummary | null; activeSession: SessionStarted | null }) {
+function LiveFramePanel({
+  latestFrame,
+  activeSession,
+  previewing,
+  recording,
+  loadingMessage
+}: {
+  latestFrame: FrameSummary | null;
+  activeSession: SessionStarted | null;
+  previewing: boolean;
+  recording: boolean;
+  loadingMessage: string | null;
+}) {
   return (
     <Card>
       <CardHeader className="border-b pb-4">
         <div className="flex items-center justify-between gap-3">
           <div>
             <CardTitle>Live Frames</CardTitle>
-            <CardDescription>{activeSession?.sessionId ?? "no session"}</CardDescription>
+            <CardDescription>
+              {recording ? "recording" : previewing ? "previewing" : "idle"} / {activeSession?.sessionId ?? "no session"}
+            </CardDescription>
           </div>
           <div className="rounded-md border bg-muted px-3 py-2 text-right">
             <div className="text-lg font-semibold leading-none">{latestFrame?.frameIndex ?? 0}</div>
@@ -548,9 +932,22 @@ function LiveFramePanel({ latestFrame, activeSession }: { latestFrame: FrameSumm
         </div>
       </CardHeader>
       <CardContent className="space-y-4 pt-4">
-        <div className="grid gap-3 lg:grid-cols-2">
-          <PreviewPane label="RGB" src={latestFrame?.colorPreviewDataUrl ?? null} icon={<Camera className="h-7 w-7" />} />
-          <PreviewPane label="Depth" src={latestFrame?.depthPreviewDataUrl ?? null} icon={<ScanLine className="h-7 w-7" />} />
+        <div className="relative">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <PreviewPane label="RGB" src={latestFrame?.colorPreviewDataUrl ?? null} icon={<Camera className="h-7 w-7" />} />
+            <PreviewPane label="Depth" src={latestFrame?.depthPreviewDataUrl ?? null} icon={<ScanLine className="h-7 w-7" />} />
+          </div>
+          {loadingMessage ? (
+            <div className="absolute inset-0 grid place-items-center rounded-lg border bg-background/80 backdrop-blur-sm">
+              <div className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 shadow-sm">
+                <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                <div>
+                  <div className="text-sm font-semibold">Loading</div>
+                  <div className="text-xs text-muted-foreground">{loadingMessage}</div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <Stat label="Valid points" value={latestFrame ? latestFrame.depth.validPoints.toLocaleString() : "0"} />
@@ -563,7 +960,15 @@ function LiveFramePanel({ latestFrame, activeSession }: { latestFrame: FrameSumm
   );
 }
 
-function AssetPreviewPanel({ assetResult, revealAssets }: { assetResult: AssetBuildResult | null; revealAssets: () => void }) {
+function AssetPreviewPanel({
+  assetResult,
+  assetBusy,
+  revealAssets
+}: {
+  assetResult: AssetBuildResult | null;
+  assetBusy: boolean;
+  revealAssets: () => void;
+}) {
   return (
     <Card>
       <CardHeader className="border-b pb-4">
@@ -582,7 +987,20 @@ function AssetPreviewPanel({ assetResult, revealAssets }: { assetResult: AssetBu
         </div>
       </CardHeader>
       <CardContent className="pt-4">
-        <SplatCanvas payload={assetResult?.preview ?? null} />
+        <div className="relative">
+          <SplatCanvas payload={assetResult?.preview ?? null} />
+          {assetBusy ? (
+            <div className="absolute inset-0 grid place-items-center rounded-lg border bg-background/80 backdrop-blur-sm">
+              <div className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 shadow-sm">
+                <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                <div>
+                  <div className="text-sm font-semibold">Loading</div>
+                  <div className="text-xs text-muted-foreground">Generating 3DGS, splat, OBJ, and FBX</div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
       </CardContent>
     </Card>
   );
@@ -596,7 +1014,9 @@ function OutputPanel(props: {
   assetResult: AssetBuildResult | null;
   log: string[];
   setupSdk: () => void;
+  installHelper: () => void;
   sdkSetupBusy: boolean;
+  helperInstallBusy: boolean;
   recording: boolean;
   revealSession: () => void;
 }) {
@@ -646,6 +1066,10 @@ function OutputPanel(props: {
           <Button className="w-full" variant="secondary" onClick={props.setupSdk} disabled={props.sdkSetupBusy || props.recording}>
             <Download className={cn("h-4 w-4", props.sdkSetupBusy && "animate-bounce")} />
             {props.sdkSetupBusy ? "Setting up" : "Setup SDK"}
+          </Button>
+          <Button className="w-full" variant="outline" onClick={props.installHelper} disabled={props.helperInstallBusy || props.recording}>
+            <Cpu className={cn("h-4 w-4", props.helperInstallBusy && "animate-pulse")} />
+            {props.helperInstallBusy ? "Installing helper" : "Install no-sudo helper"}
           </Button>
           {props.devices.length ? (
             props.devices.map((device) => (
@@ -750,7 +1174,7 @@ function PreviewPane({ label, src, icon }: { label: string; src: string | null; 
     <figure className="overflow-hidden rounded-lg border bg-zinc-950">
       <div className="grid aspect-[4/3] place-items-center">
         {src ? (
-          <img src={src} alt={`${label} preview`} className="h-full w-full object-contain" />
+          <img key={src.slice(0, 96)} src={src} alt={`${label} preview`} className="h-full w-full object-contain" />
         ) : (
           <div className="grid place-items-center gap-2 text-zinc-400">
             {icon}
@@ -889,7 +1313,13 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       log: ["Preview mode"]
     } as T;
   }
-  if (command === "start_recording") {
+  if (command === "install_privileged_helper") {
+    return {
+      path: "/preview/realsense-helper",
+      status: "Preview mode: helper install runs only inside Tauri"
+    } as T;
+  }
+  if (command === "start_recording" || command === "start_preview") {
     return {
       sessionId: `preview_${Date.now()}`,
       root: "/preview/SmartAgricultureScans",
@@ -897,8 +1327,20 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       notice: "Browser preview mode"
     } as T;
   }
-  if (command === "stop_recording") {
+  if (command === "stop_recording" || command === "stop_preview") {
     return { framesWritten: 0 } as T;
+  }
+  if (command === "read_latest_privileged_preview_frame") {
+    return {
+      sessionId: `preview_${Date.now()}`,
+      frameIndex: 1,
+      timestampMs: 0,
+      frameNumber: 1,
+      colorPreviewDataUrl: drawMockFrame("rgb", 1),
+      depthPreviewDataUrl: drawMockFrame("depth", 1),
+      depth: { validPoints: 19200, minM: 0.31, maxM: 0.76, meanM: 0.48 },
+      paths: { rgb: null, depth: "-", pointCloud: "-", metadata: "-" }
+    } as T;
   }
   if (command === "generate_scan_assets") {
     const points = mockPreviewPoints();

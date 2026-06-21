@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Read,
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -18,6 +19,7 @@ use crate::{realsense, storage};
 #[derive(Default)]
 pub struct AppState {
     recording: Mutex<Option<RecordingHandle>>,
+    preview: Mutex<Option<PreviewHandle>>,
 }
 
 struct RecordingHandle {
@@ -26,6 +28,14 @@ struct RecordingHandle {
     backend: String,
     stop: Arc<AtomicBool>,
     frames_written: Arc<AtomicU32>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct PreviewHandle {
+    session_id: String,
+    backend: String,
+    stop: Arc<AtomicBool>,
+    frames_sent: Arc<AtomicU32>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -63,9 +73,9 @@ pub struct ResolvedCaptureConfig {
 
 impl CaptureConfig {
     fn resolve(self) -> ResolvedCaptureConfig {
-        let width = self.width.unwrap_or(640).clamp(320, 1280);
-        let height = self.height.unwrap_or(480).clamp(240, 720);
-        let fps = self.fps.unwrap_or(6).clamp(1, 30);
+        let width = self.width.unwrap_or(1280).clamp(320, 1280);
+        let height = self.height.unwrap_or(720).clamp(240, 720);
+        let fps = self.fps.unwrap_or(30).clamp(1, 30);
         let backend = self.backend.unwrap_or_else(|| "auto".to_string());
         let point_stride = self.point_stride.unwrap_or(4).clamp(1, 12);
         let min_depth_m = self.min_depth_m.unwrap_or(0.12).clamp(0.02, 4.0);
@@ -167,7 +177,7 @@ pub struct UsbRealSenseDevice {
     pub location_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DepthStats {
     pub valid_points: usize,
@@ -176,7 +186,7 @@ pub struct DepthStats {
     pub mean_m: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FramePaths {
     pub rgb: Option<String>,
@@ -185,7 +195,7 @@ pub struct FramePaths {
     pub metadata: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSummary {
     pub session_id: String,
@@ -219,6 +229,23 @@ pub struct SessionStopped {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrivilegedPreviewStarted {
+    pub session_id: String,
+    pub frame_path: String,
+    pub pid_path: String,
+    pub log_path: String,
+    pub launch_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledHelper {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CaptureEvent {
     kind: String,
     summary: Option<FrameSummary>,
@@ -242,6 +269,7 @@ pub fn start_recording(
     config: CaptureConfig,
 ) -> Result<SessionStarted, String> {
     let config = config.resolve();
+    stop_preview_if_running(&state)?;
     let mut guard = state
         .recording
         .lock()
@@ -349,6 +377,329 @@ pub fn start_recording(
 }
 
 #[tauri::command]
+pub fn start_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    config: CaptureConfig,
+) -> Result<SessionStarted, String> {
+    let config = config.resolve();
+    if state
+        .recording
+        .lock()
+        .map_err(|_| "recording state is locked".to_string())?
+        .is_some()
+    {
+        return Err("stop recording before starting preview".to_string());
+    }
+
+    let mut guard = state
+        .preview
+        .lock()
+        .map_err(|_| "preview state is locked".to_string())?;
+
+    if guard.is_some() {
+        return Err("preview is already active".to_string());
+    }
+
+    let (mut backend, backend_name, notice) = create_backend(&config)?;
+    let session_id = format!("live_preview_{}", chrono::Local::now().format("%H%M%S"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let frames_sent = Arc::new(AtomicU32::new(0));
+
+    let thread_stop = Arc::clone(&stop);
+    let thread_frames_sent = Arc::clone(&frames_sent);
+    let thread_config = config.clone();
+    let thread_session_id = session_id.clone();
+
+    let handle = thread::spawn(move || {
+        let interval = Duration::from_secs_f64(1.0 / thread_config.fps as f64);
+        let mut frame_index = 0u32;
+        let mut consecutive_errors = 0u32;
+
+        while !thread_stop.load(Ordering::SeqCst) {
+            let loop_started = Instant::now();
+            match backend.capture_frame() {
+                Ok(frame) => {
+                    consecutive_errors = 0;
+                    frame_index += 1;
+                    match storage::preview_frame_summary(
+                        &thread_session_id,
+                        &thread_config,
+                        frame_index,
+                        &frame,
+                    ) {
+                        Ok(summary) => {
+                            thread_frames_sent.store(frame_index, Ordering::SeqCst);
+                            let _ = app.emit(
+                                "capture-progress",
+                                CaptureEvent {
+                                    kind: "frame".to_string(),
+                                    summary: Some(summary),
+                                    message: None,
+                                },
+                            );
+                        }
+                        Err(error) => emit_error(&app, format!("failed to render preview: {error}")),
+                    }
+                }
+                Err(error) => {
+                    consecutive_errors += 1;
+                    emit_error(&app, error);
+                    if consecutive_errors >= 8 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+
+            let elapsed = loop_started.elapsed();
+            if elapsed < interval {
+                thread::sleep(interval - elapsed);
+            }
+        }
+
+        let count = thread_frames_sent.load(Ordering::SeqCst);
+        let _ = app.emit(
+            "capture-progress",
+            CaptureEvent {
+                kind: "finished".to_string(),
+                summary: None,
+                message: Some(format!("preview stopped: {count} frames")),
+            },
+        );
+    });
+
+    *guard = Some(PreviewHandle {
+        session_id: session_id.clone(),
+        backend: backend_name.clone(),
+        stop,
+        frames_sent,
+        handle: Some(handle),
+    });
+
+    Ok(SessionStarted {
+        session_id,
+        root: String::new(),
+        backend: backend_name,
+        notice,
+        config,
+    })
+}
+
+#[tauri::command]
+pub fn start_privileged_preview(
+    app: tauri::AppHandle,
+    config: CaptureConfig,
+) -> Result<PrivilegedPreviewStarted, String> {
+    let config = config.resolve();
+    let session_id = format!("realsense_preview_{}", chrono::Local::now().format("%H%M%S"));
+    let frame_path = std::env::temp_dir().join(format!("{session_id}.json"));
+    let pid_path = std::env::temp_dir().join(format!("{session_id}.pid"));
+    let log_path = std::env::temp_dir().join(format!("{session_id}.log"));
+
+    if let Some(helper) = installed_helper_if_ready() {
+        let launch_log = std::env::temp_dir().join(format!("{session_id}_launch.log"));
+        let stderr = fs::File::create(&launch_log)
+            .map_err(|error| format!("failed to create helper launch log: {error}"))?;
+        let child = Command::new(&helper)
+            .arg("live")
+            .arg(&frame_path)
+            .arg(config.width.to_string())
+            .arg(config.height.to_string())
+            .arg(config.fps.to_string())
+            .arg(&session_id)
+            .arg(&log_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("failed to start installed RealSense helper: {error}"))?;
+        fs::write(&pid_path, child.id().to_string())
+            .map_err(|error| format!("failed to write helper pid: {error}"))?;
+        spawn_privileged_preview_event_bridge(app, frame_path.clone(), pid_path.clone());
+
+        return Ok(PrivilegedPreviewStarted {
+            session_id,
+            frame_path: frame_path.to_string_lossy().to_string(),
+            pid_path: pid_path.to_string_lossy().to_string(),
+            log_path: log_path.to_string_lossy().to_string(),
+            launch_mode: "installed-helper".to_string(),
+        });
+    }
+
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("failed to locate app executable: {error}"))?;
+    let osascript = PathBuf::from("/usr/bin/osascript");
+
+    let kill_daemons = "killall -9 UVCAssistant VDCAssistant cameracaptured appleh16camerad AppleCameraAssistant com.apple.cmio.registerassistantservice 2>/dev/null || true";
+    let kill_helpers = "pkill -9 -f 'smart-agriculture-tomato-twin --realsense-helper live' 2>/dev/null || true; pkill -9 -f '/usr/local/libexec/tomato-twin/realsense-helper live' 2>/dev/null || true";
+    let shell = format!(
+        "{kill_helpers}; {kill_daemons}; (i=0; while [ $i -lt 80 ]; do {kill_daemons}; i=$((i+1)); sleep 0.05; done) >/dev/null 2>&1 & {} --realsense-helper live {} {} {} {} {} {} >/tmp/tomato-twin-helper-launch.log 2>&1 & echo $! > {}",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(&frame_path.to_string_lossy()),
+        config.width,
+        config.height,
+        config.fps,
+        shell_quote(&session_id),
+        shell_quote(&log_path.to_string_lossy()),
+        shell_quote(&pid_path.to_string_lossy()),
+    );
+    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
+
+    run_osascript_with_timeout(osascript, script, Duration::from_secs(20))
+        .map_err(|error| format!("administrator preview helper failed: {error}"))?;
+    spawn_privileged_preview_event_bridge(app, frame_path.clone(), pid_path.clone());
+
+    Ok(PrivilegedPreviewStarted {
+        session_id,
+        frame_path: frame_path.to_string_lossy().to_string(),
+        pid_path: pid_path.to_string_lossy().to_string(),
+        log_path: log_path.to_string_lossy().to_string(),
+        launch_mode: "administrator-osascript".to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn install_privileged_helper() -> Result<InstalledHelper, String> {
+    let source = helper_source_path()?;
+    let destination = installed_helper_path();
+    let destination_dir = destination
+        .parent()
+        .ok_or_else(|| "installed helper destination has no parent".to_string())?;
+
+    let shell = format!(
+        "mkdir -p {}; cp -f {} {}; chown root:wheel {}; chmod 4755 {}",
+        shell_quote(&destination_dir.to_string_lossy()),
+        shell_quote(&source.to_string_lossy()),
+        shell_quote(&destination.to_string_lossy()),
+        shell_quote(&destination.to_string_lossy()),
+        shell_quote(&destination.to_string_lossy()),
+    );
+    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
+    run_osascript_with_timeout(PathBuf::from("/usr/bin/osascript"), script, Duration::from_secs(60))
+        .map_err(|error| format!("helper install failed: {error}"))?;
+
+    if installed_helper_if_ready().is_none() {
+        return Err("helper was installed, but setuid permission is not active".to_string());
+    }
+
+    Ok(InstalledHelper {
+        path: destination.to_string_lossy().to_string(),
+        status: "No-sudo RealSense helper installed".to_string(),
+    })
+}
+
+#[tauri::command]
+pub fn read_privileged_preview_frame(frame_path: String) -> Result<FrameSummary, String> {
+    let bytes = fs::read(&frame_path)
+        .map_err(|error| format!("waiting for RealSense preview frame: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("invalid preview frame JSON: {error}"))
+}
+
+#[tauri::command]
+pub fn read_latest_privileged_preview_frame() -> Result<FrameSummary, String> {
+    let temp_dir = std::env::temp_dir();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = fs::read_dir(&temp_dir)
+        .map_err(|error| format!("failed to scan preview temp dir: {error}"))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("realsense_preview_") || !name.ends_with(".json") || name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(current_modified, _)| modified > *current_modified)
+        {
+            newest = Some((modified, path));
+        }
+    }
+
+    let (_, path) = newest.ok_or_else(|| "no RealSense preview frame JSON found".to_string())?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("failed to stat latest preview frame: {error}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| format!("failed to read latest preview timestamp: {error}"))?;
+    if modified
+        .elapsed()
+        .map(|elapsed| elapsed > Duration::from_secs(5))
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "latest preview frame is stale: {}",
+            path.to_string_lossy()
+        ));
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("failed to read latest preview frame: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "invalid latest preview frame JSON at {}: {error}",
+            path.to_string_lossy()
+        )
+    })
+}
+
+#[tauri::command]
+pub fn stop_privileged_preview(pid_path: String, launch_mode: Option<String>) -> Result<(), String> {
+    let pid = fs::read_to_string(&pid_path)
+        .map_err(|error| format!("failed to read privileged preview pid: {error}"))?;
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return Ok(());
+    }
+
+    if launch_mode.as_deref() == Some("installed-helper") {
+        let status = Command::new("kill")
+            .arg(pid)
+            .status()
+            .map_err(|error| format!("failed to stop installed helper: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    let shell = format!("kill {} 2>/dev/null || true", shell_quote(pid));
+    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
+    let _ = Command::new("/usr/bin/osascript").arg("-e").arg(script).output();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stop_preview(state: State<'_, AppState>) -> Result<SessionStopped, String> {
+    let mut preview = state
+        .preview
+        .lock()
+        .map_err(|_| "preview state is locked".to_string())?
+        .take()
+        .ok_or_else(|| "preview is not active".to_string())?;
+
+    preview.stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = preview.handle.take() {
+        handle
+            .join()
+            .map_err(|_| "preview thread did not finish cleanly".to_string())?;
+    }
+
+    Ok(SessionStopped {
+        session_id: preview.session_id,
+        root: String::new(),
+        backend: preview.backend,
+        frames_written: preview.frames_sent.load(Ordering::SeqCst),
+    })
+}
+
+#[tauri::command]
 pub fn stop_recording(state: State<'_, AppState>) -> Result<SessionStopped, String> {
     let mut recording = state
         .recording
@@ -421,6 +772,179 @@ fn create_backend(
             )),
         },
     }
+}
+
+fn stop_preview_if_running(state: &State<'_, AppState>) -> Result<(), String> {
+    let maybe_preview = state
+        .preview
+        .lock()
+        .map_err(|_| "preview state is locked".to_string())?
+        .take();
+
+    if let Some(mut preview) = maybe_preview {
+        preview.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = preview.handle.take() {
+            handle
+                .join()
+                .map_err(|_| "preview thread did not finish cleanly".to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_privileged_preview_event_bridge(
+    app: tauri::AppHandle,
+    frame_path: PathBuf,
+    pid_path: PathBuf,
+) {
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut last_frame_index = 0u32;
+        let mut misses = 0u32;
+
+        loop {
+            if started.elapsed() > Duration::from_secs(60 * 60) {
+                break;
+            }
+
+            match fs::read(&frame_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<FrameSummary>(&bytes).ok())
+            {
+                Some(summary) if summary.frame_index != last_frame_index => {
+                    last_frame_index = summary.frame_index;
+                    misses = 0;
+                    let _ = app.emit(
+                        "capture-progress",
+                        CaptureEvent {
+                            kind: "frame".to_string(),
+                            summary: Some(summary),
+                            message: None,
+                        },
+                    );
+                }
+                Some(_) => {
+                    misses = misses.saturating_add(1);
+                }
+                None => {
+                    misses = misses.saturating_add(1);
+                }
+            }
+
+            if misses > 300 && !helper_pid_exists(&pid_path) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(33));
+        }
+    });
+}
+
+fn helper_pid_exists(pid_path: &PathBuf) -> bool {
+    let Ok(pid_text) = fs::read_to_string(pid_path) else {
+        return true;
+    };
+    let Ok(pid) = pid_text.trim().parse::<i32>() else {
+        return false;
+    };
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(pid as libc::pid_t, 0) == 0 {
+            return true;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
+        errno == libc::EPERM
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn installed_helper_path() -> PathBuf {
+    PathBuf::from("/usr/local/libexec/tomato-twin/realsense-helper")
+}
+
+fn helper_source_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("failed to locate app executable: {error}"))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| "app executable has no parent directory".to_string())?;
+    let helper_name = if cfg!(target_os = "windows") {
+        "realsense-helper.exe"
+    } else {
+        "realsense-helper"
+    };
+    let helper = exe_dir.join(helper_name);
+    if helper.exists() {
+        return Ok(helper);
+    }
+    Err(format!(
+        "RealSense helper binary was not found at {}. Run `cargo build --manifest-path src-tauri/Cargo.toml --bin realsense-helper` first.",
+        helper.to_string_lossy()
+    ))
+}
+
+fn installed_helper_if_ready() -> Option<PathBuf> {
+    let path = installed_helper_path();
+    let metadata = fs::metadata(&path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o4000 == 0 {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn run_osascript_with_timeout(osascript: PathBuf, script: String, timeout: Duration) -> Result<(), String> {
+    let mut child = Command::new(osascript)
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run osascript: {error}"))?;
+    let started = Instant::now();
+
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("failed to wait for osascript: {error}"))?
+        {
+            Some(status) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!("{stderr}{stdout}"));
+            }
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("administrator prompt timed out".to_string());
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn apple_script_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn emit_error(app: &tauri::AppHandle, message: String) {
