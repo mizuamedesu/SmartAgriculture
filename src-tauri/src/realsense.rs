@@ -12,7 +12,7 @@ use libloading::Library;
 
 use crate::capture::{
     CameraBackend, CameraDevice, ColorFrame, DepthFrame, Intrinsics, ResolvedCaptureConfig,
-    RuntimeProbe, SensorFrame,
+    RuntimeProbe, SensorFrame, UsbRealSenseDevice,
 };
 
 const RS2_STREAM_DEPTH: c_int = 1;
@@ -328,30 +328,52 @@ impl Rs2Api {
 }
 
 pub fn probe_runtime() -> RuntimeProbe {
+    let usb_devices = detect_usb_realsense_devices();
     match Rs2Api::load() {
         Ok(api) => {
             let api_version = api.api_version_string().ok();
             match list_devices_with_api(&api) {
                 Ok(devices) => {
-                    let status = if devices.is_empty() {
-                        "librealsense2 loaded; no RealSense device detected".to_string()
+                    let (status, action_required) = if devices.is_empty() && !usb_devices.is_empty() {
+                        usb_diagnostic_status(&usb_devices)
+                    } else if devices.is_empty() {
+                        (
+                            "librealsense2 loaded; no RealSense device detected".to_string(),
+                            None,
+                        )
                     } else {
-                        format!("librealsense2 loaded; {} RealSense device(s) detected", devices.len())
+                        (
+                            format!(
+                                "librealsense2 loaded; {} RealSense device(s) detected",
+                                devices.len()
+                            ),
+                            None,
+                        )
                     };
                     RuntimeProbe {
                         sdk_loaded: true,
                         api_version,
                         devices,
+                        usb_devices,
                         status,
                         install_hint: None,
+                        action_required,
                     }
                 }
                 Err(error) => RuntimeProbe {
                     sdk_loaded: true,
                     api_version,
                     devices: Vec::new(),
-                    status: format!("librealsense2 loaded; device query failed: {error}"),
-                    install_hint: None,
+                    usb_devices: usb_devices.clone(),
+                    status: if usb_devices.is_empty() {
+                        format!("librealsense2 loaded; device query failed: {error}")
+                    } else {
+                        format!(
+                            "RealSense is visible on USB, but librealsense cannot open it: {error}"
+                        )
+                    },
+                    install_hint: Some("Check USB3 cable/port, then unplug and reconnect the camera.".to_string()),
+                    action_required: usb_diagnostic_status(&usb_devices).1,
                 },
             }
         }
@@ -359,10 +381,16 @@ pub fn probe_runtime() -> RuntimeProbe {
             sdk_loaded: false,
             api_version: None,
             devices: Vec::new(),
-            status: "librealsense2 is not installed or cannot be loaded".to_string(),
+            usb_devices: usb_devices.clone(),
+            status: if usb_devices.is_empty() {
+                "librealsense2 is not installed or cannot be loaded".to_string()
+            } else {
+                "RealSense is visible on USB, but librealsense is not loadable".to_string()
+            },
             install_hint: Some(format!(
                 "{error}. On macOS, install the Intel RealSense SDK with `brew install librealsense`, then confirm `rs-enumerate-devices` can see the camera."
             )),
+            action_required: usb_diagnostic_status(&usb_devices).1,
         },
     }
 }
@@ -437,6 +465,39 @@ pub fn ensure_realsense_sdk() -> Result<SdkSetupResult, String> {
         log.push("librealsense2 is still not loadable after setup".to_string());
     }
 
+    let usb_devices = detect_usb_realsense_devices();
+    if !usb_devices.is_empty() {
+        for device in &usb_devices {
+            log.push(format!(
+                "USB sees {} at {} Mbps{}",
+                device.product_name,
+                device
+                    .link_speed_mbps
+                    .map(|speed| speed.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                device
+                    .usb_type
+                    .as_ref()
+                    .map(|usb_type| format!(" / USB {usb_type}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if usb_devices.iter().any(|device| device.link_speed_mbps.unwrap_or(0) < 5_000) {
+            log.push("RealSense is connected below USB3 speed; RGB-D streaming is unlikely to work.".to_string());
+        }
+    }
+
+    if !usb_devices.is_empty() {
+        if let Some(osascript) = find_executable("osascript") {
+            log.push("resetting macOS camera daemons".to_string());
+            let script = "do shell script \"killall VDCAssistant 2>/dev/null || true; killall AppleCameraAssistant 2>/dev/null || true; killall cameracaptured 2>/dev/null || true; killall appleh16camerad 2>/dev/null || true\" with administrator privileges";
+            match run_command(&osascript, &["-e", script]) {
+                Ok(output) => log.push(format!("camera daemon reset: {}", output.summary())),
+                Err(error) => log.push(format!("camera daemon reset skipped: {error}")),
+            }
+        }
+    }
+
     let rs_enumerate = find_executable("rs-enumerate-devices");
     let mut enumerate_ran = false;
     let mut device_check_ok = false;
@@ -489,6 +550,14 @@ unsafe impl Send for RealSenseCamera {}
 
 impl RealSenseCamera {
     pub fn open(config: &ResolvedCaptureConfig) -> Result<Self, String> {
+        Self::open_with_color(config, true).or_else(|color_error| {
+            Self::open_with_color(config, false).map_err(|depth_error| {
+                format!("RGB-D open failed: {color_error}; depth-only open failed: {depth_error}")
+            })
+        })
+    }
+
+    fn open_with_color(config: &ResolvedCaptureConfig, enable_color: bool) -> Result<Self, String> {
         let api = Arc::new(Rs2Api::load()?);
         let api_version = api.api_version()?;
         let context = api.call(|error| unsafe { (api.rs2_create_context)(api_version, error) })?;
@@ -533,18 +602,20 @@ impl RealSenseCamera {
                     error,
                 )
             })?;
-            api.call(|error| unsafe {
-                (api.rs2_config_enable_stream)(
-                    rs_config,
-                    RS2_STREAM_COLOR,
-                    -1,
-                    config.width as c_int,
-                    config.height as c_int,
-                    RS2_FORMAT_RGB8,
-                    config.fps as c_int,
-                    error,
-                )
-            })?;
+            if enable_color {
+                api.call(|error| unsafe {
+                    (api.rs2_config_enable_stream)(
+                        rs_config,
+                        RS2_STREAM_COLOR,
+                        -1,
+                        config.width as c_int,
+                        config.height as c_int,
+                        RS2_FORMAT_RGB8,
+                        config.fps as c_int,
+                        error,
+                    )
+                })?;
+            }
             Ok(())
         };
 
@@ -978,6 +1049,130 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 
 fn brew_path_string(path: Option<&PathBuf>) -> Option<String> {
     path.map(|path| path.to_string_lossy().to_string())
+}
+
+fn detect_usb_realsense_devices() -> Vec<UsbRealSenseDevice> {
+    let ioreg = PathBuf::from("/usr/sbin/ioreg");
+    let output = match run_command(&ioreg, &["-p", "IOUSB", "-l", "-w", "0"]) {
+        Ok(output) if output.status_success => output.stdout,
+        _ => return Vec::new(),
+    };
+
+    let mut devices = Vec::new();
+    let mut current: Option<UsbRealSenseDevice> = None;
+
+    for line in output.lines() {
+        if line.contains("+-o ") && line.to_ascii_lowercase().contains("realsense") {
+            if let Some(device) = current.take() {
+                devices.push(device);
+            }
+            let product_name = line
+                .split("+-o ")
+                .nth(1)
+                .and_then(|value| value.split('@').next())
+                .unwrap_or("Intel RealSense")
+                .trim()
+                .to_string();
+            current = Some(UsbRealSenseDevice {
+                product_name,
+                link_speed_mbps: None,
+                usb_type: None,
+                id_product: None,
+                location_id: None,
+            });
+            continue;
+        }
+
+        if let Some(device) = current.as_mut() {
+            if line.contains("\"UsbLinkSpeed\"") {
+                if let Some(value) = parse_ioreg_u64(line) {
+                    device.link_speed_mbps = Some((value / 1_000_000) as u32);
+                }
+            } else if line.contains("\"USB Product Name\"") || line.contains("\"kUSBProductString\"") {
+                if let Some(value) = parse_ioreg_string(line) {
+                    device.product_name = value;
+                }
+            } else if line.contains("\"idProduct\"") {
+                device.id_product = parse_ioreg_u64(line).map(|value| format!("0x{value:04X}"));
+            } else if line.contains("\"locationID\"") {
+                device.location_id = parse_ioreg_u64(line).map(|value| format!("0x{value:X}"));
+            } else if line.contains("\"bcdUSB\"") {
+                if let Some(value) = parse_ioreg_u64(line) {
+                    let major = (value >> 8) & 0xff;
+                    let minor = (value >> 4) & 0x0f;
+                    device.usb_type = Some(format!("{major}.{minor}"));
+                }
+            } else if line.trim() == "}" {
+                if let Some(device) = current.take() {
+                    devices.push(device);
+                }
+            }
+        }
+    }
+
+    if let Some(device) = current {
+        devices.push(device);
+    }
+
+    devices
+}
+
+fn usb_diagnostic_status(devices: &[UsbRealSenseDevice]) -> (String, Option<String>) {
+    if devices.is_empty() {
+        return ("No RealSense USB device detected".to_string(), None);
+    }
+
+    let has_slow_link = devices
+        .iter()
+        .any(|device| device.link_speed_mbps.unwrap_or(0) < 5_000);
+
+    if has_slow_link {
+        let summaries = devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{} at {} Mbps{}",
+                    device.product_name,
+                    device
+                        .link_speed_mbps
+                        .map(|speed| speed.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    device
+                        .usb_type
+                        .as_ref()
+                        .map(|usb_type| format!(" / USB {usb_type}"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            format!("RealSense USB device detected, but not at USB3 speed: {summaries}"),
+            Some("The D435i is connected, but the current USB link is below 5 Gbps. Use a short USB3/USB-C data cable, flip/reseat both ends, or try another Mac port; RGB-D streaming cannot open reliably at USB2 speed.".to_string()),
+        )
+    } else {
+        (
+            format!("{} RealSense USB device(s) detected, but SDK could not open them", devices.len()),
+            Some("Close camera apps, run Setup SDK, then reconnect the camera if the SDK still cannot claim the interface.".to_string()),
+        )
+    }
+}
+
+fn parse_ioreg_u64(line: &str) -> Option<u64> {
+    let value = line.split('=').nth(1)?.trim();
+    if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value
+            .split(|ch: char| !ch.is_ascii_digit())
+            .find(|part| !part.is_empty())
+            .and_then(|part| part.parse::<u64>().ok())
+    }
+}
+
+fn parse_ioreg_string(line: &str) -> Option<String> {
+    let value = line.split('=').nth(1)?.trim();
+    Some(value.trim_matches('"').to_string())
 }
 
 unsafe fn c_string(ptr: *const c_char) -> String {

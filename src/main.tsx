@@ -59,8 +59,18 @@ interface RuntimeProbe {
   sdkLoaded: boolean;
   apiVersion: string | null;
   devices: CameraDevice[];
+  usbDevices: UsbRealSenseDevice[];
   status: string;
   installHint: string | null;
+  actionRequired: string | null;
+}
+
+interface UsbRealSenseDevice {
+  productName: string;
+  linkSpeedMbps: number | null;
+  usbType: string | null;
+  idProduct: string | null;
+  locationId: string | null;
 }
 
 interface SdkSetupResult {
@@ -183,6 +193,7 @@ function App() {
   const [sdkSetupBusy, setSdkSetupBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const mockTimer = useRef<number | null>(null);
+  const autoSetupAttempted = useRef(false);
 
   const devices = probe?.devices ?? [];
   const backend = activeSession?.backend ?? config.backend;
@@ -192,13 +203,18 @@ function App() {
     setLog((current) => [`${stamp} ${message}`, ...current].slice(0, 12));
   };
 
-  const refreshProbe = async () => {
+  const refreshProbe = async (options?: { autoSetup?: boolean }) => {
     try {
       const runtime = await tauriCall<RuntimeProbe>("probe_runtime");
       const tools = await tauriCall<AssetTools>("detect_asset_tools");
       setProbe(runtime);
       setAssetTools(tools);
       pushLog(runtime.status);
+      if (options?.autoSetup && isTauri && !runtime.sdkLoaded && !autoSetupAttempted.current) {
+        autoSetupAttempted.current = true;
+        pushLog("SDK missing; running automatic setup");
+        await setupSdk();
+      }
     } catch (error) {
       pushLog(`probe failed: ${String(error)}`);
     }
@@ -288,7 +304,7 @@ function App() {
   };
 
   useEffect(() => {
-    refreshProbe();
+    refreshProbe({ autoSetup: true });
 
     if (!isTauri) return undefined;
     let unlisten: (() => void) | undefined;
@@ -344,7 +360,7 @@ function App() {
             </Badge>
           </div>
 
-          <Button size="icon" variant="outline" onClick={refreshProbe} disabled={sdkSetupBusy} title="Refresh devices">
+          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy} title="Refresh devices">
             <RefreshCw className={cn("h-4 w-4", sdkSetupBusy && "animate-spin")} />
           </Button>
         </div>
@@ -641,8 +657,35 @@ function OutputPanel(props: {
               </div>
             ))
           ) : (
-            <p className="text-sm text-muted-foreground">{props.probe?.installHint ?? props.probe?.status ?? "No device"}</p>
+            <p className="text-sm text-muted-foreground">{props.probe?.status ?? props.probe?.installHint ?? "No device"}</p>
           )}
+          {props.probe?.usbDevices?.length ? (
+            <div className="space-y-2">
+              {props.probe.usbDevices.map((device) => {
+                const slow = (device.linkSpeedMbps ?? 0) < 5000;
+                return (
+                  <div
+                    key={`${device.productName}-${device.locationId ?? ""}`}
+                    className={cn(
+                      "rounded-md border p-3",
+                      slow ? "border-amber-200 bg-amber-50 text-amber-950" : "border-emerald-200 bg-emerald-50 text-emerald-950"
+                    )}
+                  >
+                    <div className="text-sm font-medium">{device.productName}</div>
+                    <div className="mt-1 text-xs">
+                      USB {device.usbType ?? "unknown"} / {device.linkSpeedMbps ?? "unknown"} Mbps
+                    </div>
+                    {slow ? <div className="mt-2 text-xs font-medium">Current link is below USB3; RGB-D streaming will not open reliably.</div> : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          {props.probe?.actionRequired ? (
+            <div className="rounded-md border border-destructive/25 bg-destructive/10 p-3 text-xs leading-5 text-destructive">
+              {props.probe.actionRequired}
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -831,8 +874,10 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       sdkLoaded: false,
       apiVersion: null,
       devices: [],
+      usbDevices: [],
       status: "Browser preview mode",
-      installHint: "Run inside Tauri to access RealSense."
+      installHint: "Run inside Tauri to access RealSense.",
+      actionRequired: null
     } as T;
   }
   if (command === "detect_asset_tools") {

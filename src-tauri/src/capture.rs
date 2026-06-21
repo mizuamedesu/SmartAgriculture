@@ -141,8 +141,10 @@ pub struct RuntimeProbe {
     pub sdk_loaded: bool,
     pub api_version: Option<String>,
     pub devices: Vec<CameraDevice>,
+    pub usb_devices: Vec<UsbRealSenseDevice>,
     pub status: String,
     pub install_hint: Option<String>,
+    pub action_required: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +155,16 @@ pub struct CameraDevice {
     pub firmware: String,
     pub usb: String,
     pub product_line: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsbRealSenseDevice {
+    pub product_name: String,
+    pub link_speed_mbps: Option<u32>,
+    pub usb_type: Option<String>,
+    pub id_product: Option<String>,
+    pub location_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
