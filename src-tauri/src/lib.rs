@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use assets::{detect_asset_tools, generate_scan_assets};
+use assets::{detect_asset_tools, ensure_mlx_3dgs, generate_scan_assets};
 use capture::{CameraBackend, ResolvedCaptureConfig};
 use capture::{
     AppState, install_privileged_helper, list_devices, probe_runtime,
@@ -187,6 +187,7 @@ pub fn run() {
             reveal_path,
             ensure_realsense_sdk,
             detect_asset_tools,
+            ensure_mlx_3dgs,
             generate_scan_assets
         ])
         .run(tauri::generate_context!())

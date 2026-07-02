@@ -46,6 +46,12 @@ interface AssetOptions {
   gaussianRadiusM: number;
   turntableDegrees: number;
   exportFbx: boolean;
+  useMlx: boolean;
+  mlxIterations: number;
+  mlxVoxelSizeM: number;
+  mlxTrainSize: number;
+  mlxMaxTrainViews: number;
+  colliderMaxFaces: number;
 }
 
 interface CameraDevice {
@@ -77,6 +83,12 @@ interface UsbRealSenseDevice {
 interface SdkSetupResult {
   status: string;
   log: string[];
+}
+
+interface MlxSetupResult {
+  status: string;
+  log: string[];
+  tools: AssetTools;
 }
 
 interface SessionStarted {
@@ -136,6 +148,9 @@ interface CaptureEvent {
 
 interface AssetTools {
   blender: string | null;
+  python: string | null;
+  mlxAvailable: boolean;
+  mlxStatus: string;
   brushHint: string;
 }
 
@@ -160,15 +175,21 @@ interface PreviewPayload {
 
 interface AssetBuildResult {
   root: string;
+  seedGaussianPly: string;
   gaussianPly: string;
   splat: string;
   meshObj: string;
   meshFbx: string | null;
+  colliderObj: string;
+  collisionJson: string;
+  collisionFbx: string | null;
   previewJson: string;
   manifest: string;
   pointCount: number;
   faceCount: number;
   fbxStatus: string;
+  mlxStatus: string;
+  collisionStatus: string;
   tools: AssetTools;
   preview: PreviewPayload;
 }
@@ -199,12 +220,18 @@ function App() {
     maxDepthM: 1.4
   });
   const [assetOptions, setAssetOptions] = useState<AssetOptions>({
-    maxPoints: 180000,
+    maxPoints: 350000,
     frameStride: 1,
-    depthDecimation: 4,
-    gaussianRadiusM: 0.006,
+    depthDecimation: 2,
+    gaussianRadiusM: 0.0035,
     turntableDegrees: 360,
-    exportFbx: true
+    exportFbx: true,
+    useMlx: true,
+    mlxIterations: 1600,
+    mlxVoxelSizeM: 0.0025,
+    mlxTrainSize: 320,
+    mlxMaxTrainViews: 12,
+    colliderMaxFaces: 35000
   });
   const [recording, setRecording] = useState(false);
   const [previewing, setPreviewing] = useState(false);
@@ -220,6 +247,7 @@ function App() {
   const [captureStopping, setCaptureStopping] = useState(false);
   const [assetBusy, setAssetBusy] = useState(false);
   const [sdkSetupBusy, setSdkSetupBusy] = useState(false);
+  const [mlxSetupBusy, setMlxSetupBusy] = useState(false);
   const [helperInstallBusy, setHelperInstallBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const mockTimer = useRef<number | null>(null);
@@ -241,13 +269,15 @@ function App() {
         ? "Loading: opening RealSense preview"
         : sdkSetupBusy
           ? "Loading: checking SDK"
-          : helperInstallBusy
-            ? "Loading: installing helper"
-            : assetBusy
-              ? "Loading: generating 3D assets"
-              : probeBusy
-                ? "Loading: refreshing devices"
-                : null;
+          : mlxSetupBusy
+            ? "Loading: installing MLX 3DGS"
+            : helperInstallBusy
+              ? "Loading: installing helper"
+              : assetBusy
+                ? "Loading: generating 3D assets"
+                : probeBusy
+                  ? "Loading: refreshing devices"
+                  : null;
 
   useEffect(() => {
     privilegedPreviewRef.current = privilegedPreview;
@@ -293,6 +323,21 @@ function App() {
       return null;
     } finally {
       setSdkSetupBusy(false);
+    }
+  };
+
+  const setupMlx3dgs = async () => {
+    setMlxSetupBusy(true);
+    pushLog("installing MLX 3DGS backend: mlx + gsplat-mlx");
+    try {
+      const result = await tauriCall<MlxSetupResult>("ensure_mlx_3dgs");
+      setAssetTools(result.tools);
+      pushLog(result.status);
+      result.log.slice(-3).reverse().forEach((line) => pushLog(firstLine(line)));
+    } catch (error) {
+      pushLog(`MLX 3DGS setup failed: ${String(error)}`);
+    } finally {
+      setMlxSetupBusy(false);
     }
   };
 
@@ -565,7 +610,7 @@ function App() {
       return;
     }
     setAssetBusy(true);
-    pushLog("building 3DGS seed, preview cloud, OBJ, and FBX");
+    pushLog(assetOptions.useMlx ? "building MLX-refined 3DGS, collider, OBJ, and FBX" : "building 3DGS seed, collider, OBJ, and FBX");
     try {
       const result = await tauriCall<AssetBuildResult>("generate_scan_assets", {
         options: {
@@ -575,6 +620,8 @@ function App() {
       });
       setAssetResult(result);
       pushLog(`assets ready: ${result.pointCount.toLocaleString()} splats`);
+      pushLog(result.mlxStatus);
+      pushLog(result.collisionStatus);
       pushLog(result.fbxStatus);
     } catch (error) {
       pushLog(`asset generation failed: ${String(error)}`);
@@ -669,8 +716,8 @@ function App() {
             ) : null}
           </div>
 
-          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy || probeBusy} title="Refresh devices">
-            <RefreshCw className={cn("h-4 w-4", (sdkSetupBusy || probeBusy) && "animate-spin")} />
+          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy || mlxSetupBusy || probeBusy} title="Refresh devices">
+            <RefreshCw className={cn("h-4 w-4", (sdkSetupBusy || mlxSetupBusy || probeBusy) && "animate-spin")} />
           </Button>
         </div>
       </header>
@@ -725,8 +772,10 @@ function App() {
           assetResult={assetResult}
           log={log}
           setupSdk={setupSdk}
+          setupMlx3dgs={setupMlx3dgs}
           installHelper={installHelper}
           sdkSetupBusy={sdkSetupBusy}
+          mlxSetupBusy={mlxSetupBusy}
           helperInstallBusy={helperInstallBusy}
           recording={recording}
           revealSession={() => revealPath(activeSession?.root)}
@@ -872,7 +921,9 @@ function ControlPanel(props: {
           <div className="mb-3 flex items-center justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold">3DGS / FBX</h3>
-              <p className="text-xs text-muted-foreground">{props.assetTools?.blender ? "Blender ready" : "FBX optional"}</p>
+              <p className="text-xs text-muted-foreground">
+                {props.assetOptions.useMlx ? props.assetTools?.mlxStatus ?? "MLX optional" : props.assetTools?.blender ? "Blender ready" : "FBX optional"}
+              </p>
             </div>
             <WandSparkles className="h-4 w-4 text-muted-foreground" />
           </div>
@@ -881,7 +932,21 @@ function ControlPanel(props: {
             <NumberField label="Depth step" value={props.assetOptions.depthDecimation} min={1} max={16} onChange={(v) => updateAsset("depthDecimation", v)} />
             <NumberField label="Max splats" value={props.assetOptions.maxPoints} min={5000} max={1500000} step={1000} onChange={(v) => updateAsset("maxPoints", v)} />
             <NumberField label="Radius m" value={props.assetOptions.gaussianRadiusM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("gaussianRadiusM", v)} />
+            <NumberField label="MLX iters" value={props.assetOptions.mlxIterations} min={0} max={20000} step={100} onChange={(v) => updateAsset("mlxIterations", v)} />
+            <NumberField label="Voxel m" value={props.assetOptions.mlxVoxelSizeM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("mlxVoxelSizeM", v)} />
+            <NumberField label="Train px" value={props.assetOptions.mlxTrainSize} min={64} max={1024} step={32} onChange={(v) => updateAsset("mlxTrainSize", v)} />
+            <NumberField label="Train views" value={props.assetOptions.mlxMaxTrainViews} min={1} max={64} onChange={(v) => updateAsset("mlxMaxTrainViews", v)} />
             <NumberField label="Turntable" value={props.assetOptions.turntableDegrees} min={0} max={1080} onChange={(v) => updateAsset("turntableDegrees", v)} />
+            <NumberField label="Collider faces" value={props.assetOptions.colliderMaxFaces} min={500} max={120000} step={500} onChange={(v) => updateAsset("colliderMaxFaces", v)} />
+            <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
+              <input
+                className="h-4 w-4 rounded border-input"
+                type="checkbox"
+                checked={props.assetOptions.useMlx}
+                onChange={(event) => updateAsset("useMlx", event.target.checked)}
+              />
+              MLX refine
+            </label>
             <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
               <input
                 className="h-4 w-4 rounded border-input"
@@ -995,7 +1060,7 @@ function AssetPreviewPanel({
                 <Loader2 className="h-5 w-5 animate-spin text-primary" />
                 <div>
                   <div className="text-sm font-semibold">Loading</div>
-                  <div className="text-xs text-muted-foreground">Generating 3DGS, splat, OBJ, and FBX</div>
+                  <div className="text-xs text-muted-foreground">Generating MLX 3DGS, collision, OBJ, and FBX</div>
                 </div>
               </div>
             </div>
@@ -1014,8 +1079,10 @@ function OutputPanel(props: {
   assetResult: AssetBuildResult | null;
   log: string[];
   setupSdk: () => void;
+  setupMlx3dgs: () => void;
   installHelper: () => void;
   sdkSetupBusy: boolean;
+  mlxSetupBusy: boolean;
   helperInstallBusy: boolean;
   recording: boolean;
   revealSession: () => void;
@@ -1046,13 +1113,17 @@ function OutputPanel(props: {
       <Card>
         <CardHeader className="border-b pb-4">
           <CardTitle>Assets</CardTitle>
-          <CardDescription>3DGS, splat, mesh and FBX</CardDescription>
+          <CardDescription>MLX 3DGS, mesh, collision and FBX</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 pt-4">
+          <PathRow label="Seed PLY" value={props.assetResult?.seedGaussianPly ?? "-"} />
           <PathRow label="3DGS PLY" value={props.assetResult?.gaussianPly ?? "-"} />
           <PathRow label=".splat" value={props.assetResult?.splat ?? "-"} />
           <PathRow label="OBJ" value={props.assetResult?.meshObj ?? "-"} />
           <PathRow label="FBX" value={props.assetResult?.meshFbx ?? props.assetResult?.fbxStatus ?? "-"} />
+          <PathRow label="Collider OBJ" value={props.assetResult?.colliderObj ?? "-"} />
+          <PathRow label="Collision JSON" value={props.assetResult?.collisionJson ?? "-"} />
+          <PathRow label="Collision FBX" value={props.assetResult?.collisionFbx ?? props.assetResult?.fbxStatus ?? "-"} />
           <PathRow label="Preview" value={props.assetResult?.previewJson ?? "-"} />
         </CardContent>
       </Card>
@@ -1066,6 +1137,10 @@ function OutputPanel(props: {
           <Button className="w-full" variant="secondary" onClick={props.setupSdk} disabled={props.sdkSetupBusy || props.recording}>
             <Download className={cn("h-4 w-4", props.sdkSetupBusy && "animate-bounce")} />
             {props.sdkSetupBusy ? "Setting up" : "Setup SDK"}
+          </Button>
+          <Button className="w-full" variant="secondary" onClick={props.setupMlx3dgs} disabled={props.mlxSetupBusy || props.recording}>
+            <WandSparkles className={cn("h-4 w-4", props.mlxSetupBusy && "animate-pulse")} />
+            {props.mlxSetupBusy ? "Installing 3DGS" : "Setup MLX 3DGS"}
           </Button>
           <Button className="w-full" variant="outline" onClick={props.installHelper} disabled={props.helperInstallBusy || props.recording}>
             <Cpu className={cn("h-4 w-4", props.helperInstallBusy && "animate-pulse")} />
@@ -1305,12 +1380,19 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     } as T;
   }
   if (command === "detect_asset_tools") {
-    return { blender: null, brushHint: "Preview mode" } as T;
+    return { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" } as T;
   }
   if (command === "ensure_realsense_sdk") {
     return {
       status: "Preview mode: SDK setup runs only inside Tauri",
       log: ["Preview mode"]
+    } as T;
+  }
+  if (command === "ensure_mlx_3dgs") {
+    return {
+      status: "Preview mode: gsplat-mlx setup runs only inside Tauri",
+      log: ["Preview mode"],
+      tools: { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" }
     } as T;
   }
   if (command === "install_privileged_helper") {
@@ -1346,16 +1428,22 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     const points = mockPreviewPoints();
     return {
       root: "/preview/assets",
-      gaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_seed.ply",
-      splat: "/preview/assets/gaussian_splats/tomato_gaussians_seed.splat",
+      seedGaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_seed.ply",
+      gaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.ply",
+      splat: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.splat",
       meshObj: "/preview/assets/mesh/tomato_surface.obj",
       meshFbx: null,
+      colliderObj: "/preview/assets/mesh/tomato_collider.obj",
+      collisionJson: "/preview/assets/mesh/tomato_collision.json",
+      collisionFbx: null,
       previewJson: "/preview/assets/preview/preview_points.json",
       manifest: "/preview/assets/asset_manifest.json",
       pointCount: points.length,
       faceCount: 12000,
       fbxStatus: "Preview mode",
-      tools: { blender: null, brushHint: "Preview mode" },
+      mlxStatus: "Preview mode",
+      collisionStatus: "Preview collision collider ready",
+      tools: { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" },
       preview: {
         points,
         bounds: {
@@ -1488,6 +1576,10 @@ function shortPath(value: string) {
   if (value.length < 44) return value;
   const parts = value.split("/");
   return parts.length > 2 ? `.../${parts.slice(-2).join("/")}` : `...${value.slice(-40)}`;
+}
+
+function firstLine(value: string) {
+  return value.split("\n").find((line) => line.trim().length > 0)?.trim() ?? value;
 }
 
 createRoot(document.querySelector<HTMLDivElement>("#app")!).render(
