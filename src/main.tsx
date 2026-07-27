@@ -726,6 +726,24 @@ function App() {
           setHelperInstallBusy(false);
         }
       }
+      try {
+        const restored = await tauriCall<AssetBuildResult | null>("load_latest_scan_assets");
+        if (restored) {
+          const sessionRoot = restored.root.replace(/[\\/]assets$/, "");
+          const sessionId = sessionRoot.split(/[\\/]/).filter(Boolean).pop() ?? "restored_session";
+          setActiveSession({
+            sessionId,
+            root: sessionRoot,
+            backend: "restored",
+            notice: "Restored generated assets",
+            progressPath: null
+          });
+          setAssetResult(restored);
+          pushLog(`restored ${restored.pointCount.toLocaleString()} splats from ${sessionId}`);
+        }
+      } catch (error) {
+        pushLog(`previous asset restore failed: ${String(error)}`);
+      }
       await refreshProbe({ autoSetup: true });
     };
     void boot();
@@ -1475,15 +1493,17 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     const viewportLocation = gl.getUniformLocation(program, "u_viewport");
     const rotationLocation = gl.getUniformLocation(program, "u_rotation");
     const distanceLocation = gl.getUniformLocation(program, "u_distance");
-    let yaw = 0.35;
-    let pitch = -0.12;
+    const translationLocation = gl.getUniformLocation(program, "u_translation");
+    let yaw = 0;
+    let pitch = 0;
     let distance = span * 2.7;
+    const translation: [number, number, number] = [0, 0, 0];
+    const movementKeys = new Set<string>();
     let dragging = false;
     let previousX = 0;
     let previousY = 0;
     let animation = 0;
     let previousTime = performance.now();
-    let sortFrame = 0;
 
     const uploadSortedPoints = () => {
       const cosYaw = Math.cos(yaw);
@@ -1525,6 +1545,7 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       dragging = true;
       previousX = event.clientX;
       previousY = event.clientY;
+      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture(event.pointerId);
     };
     const onPointerMove = (event: PointerEvent) => {
@@ -1541,13 +1562,43 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     };
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      distance = Math.max(span * 0.75, Math.min(span * 8, distance * Math.exp(event.deltaY * 0.001)));
+      distance = Math.max(span * 0.08, Math.min(span * 80, distance * Math.exp(event.deltaY * 0.001)));
+    };
+    const moveCamera = (key: string, amount: number) => {
+      if (key === "w") translation[2] += amount;
+      if (key === "s") translation[2] -= amount;
+      if (key === "a") translation[0] += amount;
+      if (key === "d") translation[0] -= amount;
+      if (key === "q") translation[1] += amount;
+      if (key === "e") translation[1] -= amount;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (!["w", "a", "s", "d", "q", "e", "shift"].includes(key)) return;
+      event.preventDefault();
+      if (key !== "shift" && !event.repeat) {
+        moveCamera(key, span * (event.shiftKey ? 0.08 : 0.025));
+      }
+      movementKeys.add(key);
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      const key = event.key.toLowerCase();
+      if (!movementKeys.has(key)) return;
+      event.preventDefault();
+      movementKeys.delete(key);
+    };
+    const onBlur = () => {
+      movementKeys.clear();
     };
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointercancel", onPointerUp);
     canvas.addEventListener("wheel", onWheel, { passive: false });
+    canvas.addEventListener("keydown", onKeyDown);
+    canvas.addEventListener("keyup", onKeyUp);
+    canvas.addEventListener("blur", onBlur);
 
     gl.useProgram(program);
     gl.enable(gl.BLEND);
@@ -1557,20 +1608,20 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     const draw = (time: number) => {
       const delta = Math.min(0.05, (time - previousTime) / 1000);
       previousTime = time;
-      if (!dragging && points.length) {
-        yaw += delta * 0.16;
-        sortFrame += 1;
-        if (sortFrame % 4 === 0) uploadSortedPoints();
+      if (movementKeys.size) {
+        const speed = span * (movementKeys.has("shift") ? 1.8 : 0.55) * delta;
+        movementKeys.forEach((key) => moveCamera(key, speed));
       }
       resize();
       gl.clearColor(0.035, 0.035, 0.043, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
       if (points.length) {
         const aspect = canvas.width / Math.max(1, canvas.height);
-        gl.uniformMatrix4fv(projectionLocation, false, perspectiveMatrix(Math.PI / 4, aspect, span * 0.02, span * 20));
+        gl.uniformMatrix4fv(projectionLocation, false, perspectiveMatrix(Math.PI / 4, aspect, span * 0.002, span * 200));
         gl.uniform2f(viewportLocation, canvas.width, canvas.height);
         gl.uniform2f(rotationLocation, yaw, pitch);
         gl.uniform1f(distanceLocation, distance);
+        gl.uniform3f(translationLocation, translation[0], translation[1], translation[2]);
         gl.bindVertexArray(vao);
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, points.length);
         gl.bindVertexArray(null);
@@ -1587,6 +1638,9 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointercancel", onPointerUp);
       canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("keydown", onKeyDown);
+      canvas.removeEventListener("keyup", onKeyUp);
+      canvas.removeEventListener("blur", onBlur);
       gl.deleteBuffer(instanceBuffer);
       gl.deleteBuffer(quadBuffer);
       gl.deleteVertexArray(vao);
@@ -1600,10 +1654,15 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
         ref={canvasRef}
         width={1000}
         height={430}
-        className="h-[430px] w-full touch-none rounded-lg border bg-zinc-950 cursor-grab active:cursor-grabbing"
+        tabIndex={0}
+        aria-label="Interactive 3D Gaussian preview. Drag to rotate, use the mouse wheel to zoom, and use W A S D Q E to move."
+        className="h-[430px] w-full touch-none rounded-lg border bg-zinc-950 cursor-grab outline-none active:cursor-grabbing focus:ring-2 focus:ring-primary focus:ring-offset-2"
       />
       <div className="pointer-events-none absolute bottom-3 left-3 rounded bg-black/55 px-2 py-1 text-[11px] text-zinc-300">
-        {rendererError ?? (payload?.points.length ? "GPU Gaussian preview · drag to rotate · scroll to zoom" : "3DGS preview appears here")}
+        {rendererError ??
+          (payload?.points.length
+            ? "Static preview · drag: rotate · wheel: zoom · click then WASD: move · Q/E: down/up · Shift: faster"
+            : "3DGS preview appears here")}
       </div>
     </div>
   );
@@ -1620,6 +1679,7 @@ function createSplatProgram(gl: WebGL2RenderingContext) {
     uniform vec2 u_viewport;
     uniform vec2 u_rotation;
     uniform float u_distance;
+    uniform vec3 u_translation;
     out vec2 v_uv;
     out vec4 v_color;
 
@@ -1638,6 +1698,7 @@ function createSplatProgram(gl: WebGL2RenderingContext) {
         yawed.y * cp - yawed.z * sp,
         yawed.y * sp + yawed.z * cp - u_distance
       );
+      view += u_translation;
       vec4 clip = u_projection * vec4(view, 1.0);
       float radius_px = clamp(
         a_radius * 3.0 * u_projection[1][1] * u_viewport.y * 0.5 / max(0.001, -view.z),
@@ -1724,6 +1785,9 @@ async function tauriCall<T>(command: string, args?: Record<string, unknown>): Pr
 }
 
 async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (command === "load_latest_scan_assets") {
+    return null as T;
+  }
   if (command === "probe_runtime") {
     return {
       sdkLoaded: false,

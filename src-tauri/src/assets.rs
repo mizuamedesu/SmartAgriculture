@@ -5,13 +5,14 @@ use std::{
     io::{BufReader, BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::SystemTime,
 };
 
 use png::{BitDepth, ColorType, Decoder};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capture::Intrinsics,
+    capture::{Intrinsics, default_output_root},
     fbx::{FbxMesh, FbxVertex, write_fbx},
 };
 
@@ -135,14 +136,14 @@ struct AssetOptionsSummary {
     collider_max_faces: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewPayload {
     pub points: Vec<PreviewPoint>,
     pub bounds: Bounds,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewPoint {
     pub x: f32,
@@ -157,7 +158,7 @@ pub struct PreviewPoint {
     pub opacity: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bounds {
     pub min: [f32; 3],
@@ -212,6 +213,25 @@ struct MlxRefinement {
     status: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAssetManifest {
+    point_count: usize,
+    face_count: usize,
+    seed_gaussian_ply: String,
+    gaussian_ply: String,
+    splat: String,
+    mesh_obj: String,
+    mesh_fbx: Option<String>,
+    collider_obj: String,
+    collision_json: String,
+    collision_fbx: Option<String>,
+    preview_json: String,
+    fbx_status: String,
+    mlx_status: String,
+    collision_status: String,
+}
+
 #[tauri::command]
 pub fn detect_asset_tools() -> AssetTools {
     let python = find_python();
@@ -230,6 +250,66 @@ pub fn detect_asset_tools() -> AssetTools {
         mlx_status,
         brush_hint: "FBX is exported natively with no Blender dependency. gsplat-mlx remains the Apple Silicon 3DGS training backend.".to_string(),
     }
+}
+
+#[tauri::command]
+pub fn load_latest_scan_assets() -> Result<Option<AssetBuildResult>, String> {
+    let scans_root = default_output_root()?;
+    let mut latest: Option<(SystemTime, PathBuf)> = None;
+    let entries = fs::read_dir(&scans_root)
+        .map_err(|error| format!("failed to scan previous captures: {error}"))?;
+
+    for entry in entries.flatten() {
+        let manifest_path = entry.path().join("assets").join("asset_manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let modified = fs::metadata(&manifest_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if latest
+            .as_ref()
+            .is_none_or(|(latest_modified, _)| modified > *latest_modified)
+        {
+            latest = Some((modified, manifest_path));
+        }
+    }
+
+    let Some((_, manifest_path)) = latest else {
+        return Ok(None);
+    };
+    let manifest_data = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("failed to read previous asset manifest: {error}"))?;
+    let manifest: StoredAssetManifest = serde_json::from_str(&manifest_data)
+        .map_err(|error| format!("failed to parse previous asset manifest: {error}"))?;
+    let preview_data = fs::read_to_string(&manifest.preview_json)
+        .map_err(|error| format!("failed to read previous 3D preview: {error}"))?;
+    let preview: PreviewPayload = serde_json::from_str(&preview_data)
+        .map_err(|error| format!("failed to parse previous 3D preview: {error}"))?;
+    let asset_root = manifest_path
+        .parent()
+        .ok_or_else(|| "previous asset manifest has no parent directory".to_string())?;
+
+    Ok(Some(AssetBuildResult {
+        root: path_string(asset_root),
+        seed_gaussian_ply: manifest.seed_gaussian_ply,
+        gaussian_ply: manifest.gaussian_ply,
+        splat: manifest.splat,
+        mesh_obj: manifest.mesh_obj,
+        mesh_fbx: manifest.mesh_fbx,
+        collider_obj: manifest.collider_obj,
+        collision_json: manifest.collision_json,
+        collision_fbx: manifest.collision_fbx,
+        preview_json: manifest.preview_json,
+        manifest: path_string(&manifest_path),
+        point_count: manifest.point_count,
+        face_count: manifest.face_count,
+        fbx_status: manifest.fbx_status,
+        mlx_status: manifest.mlx_status,
+        collision_status: manifest.collision_status,
+        tools: detect_asset_tools(),
+        preview,
+    }))
 }
 
 #[tauri::command]

@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use assets::{detect_asset_tools, ensure_mlx_3dgs, generate_scan_assets};
+use assets::{
+    detect_asset_tools, ensure_mlx_3dgs, generate_scan_assets, load_latest_scan_assets,
+};
 use capture::{CameraBackend, CaptureEvent, ResolvedCaptureConfig};
 use capture::{
     AppState, ensure_privileged_helper, install_privileged_helper, list_devices,
@@ -24,6 +26,10 @@ use realsense::ensure_realsense_sdk;
 
 pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
+        Some("protocol") => {
+            println!("{}", capture::REALSENSE_HELPER_PROTOCOL);
+            Ok(())
+        }
         Some("live") => run_live_realsense_helper(&args[1..]),
         Some("record") => run_record_realsense_helper(&args[1..]),
         Some(mode) => Err(format!("unknown helper mode: {mode}")),
@@ -363,7 +369,8 @@ pub fn run() {
             ensure_realsense_sdk,
             detect_asset_tools,
             ensure_mlx_3dgs,
-            generate_scan_assets
+            generate_scan_assets,
+            load_latest_scan_assets
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tomato Twin Capture");

@@ -12,10 +12,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager, State};
 
 use crate::{realsense, storage};
+
+pub(crate) const REALSENSE_HELPER_PROTOCOL: &str = "tomato-twin-realsense-helper-v1";
 
 #[derive(Default)]
 pub struct AppState {
@@ -864,10 +865,9 @@ pub fn install_privileged_helper() -> Result<InstalledHelper, String> {
 
 #[tauri::command]
 pub fn privileged_helper_status() -> Result<InstalledHelper, String> {
-    let source = helper_source_path()?;
     let destination = installed_helper_path();
     let ready = installed_helper_if_ready().is_some();
-    let current = ready && files_have_same_digest(&source, &destination).unwrap_or(false);
+    let current = ready && helper_protocol_is_compatible(&destination);
     let status = if current {
         "RealSense helper ready; preview and recording require no additional password".to_string()
     } else if ready {
@@ -1220,32 +1220,21 @@ fn installed_helper_if_ready() -> Option<PathBuf> {
     Some(path)
 }
 
-fn files_have_same_digest(left: &PathBuf, right: &PathBuf) -> Result<bool, String> {
-    let left_metadata =
-        fs::metadata(left).map_err(|error| format!("failed to stat helper source: {error}"))?;
-    let right_metadata =
-        fs::metadata(right).map_err(|error| format!("failed to stat installed helper: {error}"))?;
-    if left_metadata.len() != right_metadata.len() {
-        return Ok(false);
+fn helper_protocol_is_compatible(path: &PathBuf) -> bool {
+    let Ok(output) = Command::new(path)
+        .args(["--realsense-helper", "protocol"])
+        .output()
+    else {
+        return false;
+    };
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout).trim() == REALSENSE_HELPER_PROTOCOL;
     }
-    Ok(file_digest(left)? == file_digest(right)?)
-}
 
-fn file_digest(path: &PathBuf) -> Result<[u8; 32], String> {
-    let mut file =
-        fs::File::open(path).map_err(|error| format!("failed to open helper binary: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| format!("failed to hash helper binary: {error}"))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(hasher.finalize().into())
+    // The first installed helper predates the explicit protocol command but
+    // uses the same live/record argument contract. Accept it so frontend-only
+    // updates do not trigger another administrator password prompt.
+    String::from_utf8_lossy(&output.stderr).contains("unknown helper mode: protocol")
 }
 
 fn run_osascript_with_timeout(osascript: PathBuf, script: String, timeout: Duration) -> Result<(), String> {
