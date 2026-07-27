@@ -1,16 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
+  Activity,
   Box,
   Camera,
+  CheckCircle2,
   Circle,
   Cpu,
   Download,
   FolderOpen,
+  HardDrive,
   Loader2,
   Radio,
   RefreshCw,
   ScanLine,
+  SlidersHorizontal,
   Square,
   WandSparkles
 } from "lucide-react";
@@ -24,6 +29,7 @@ import { cn } from "./lib/utils";
 import "./styles.css";
 
 type BackendMode = "auto" | "realsense" | "synthetic";
+type AppScreen = "capture" | "preview" | "settings";
 
 interface CaptureConfig {
   width: number;
@@ -31,6 +37,7 @@ interface CaptureConfig {
   fps: number;
   backend: BackendMode;
   targetLabel: string;
+  outputRoot: string;
   cultivar: string;
   notes: string;
   maxFrames: number | null;
@@ -212,13 +219,15 @@ const CAPTURE_PROFILES = [
 ] as const;
 
 function App() {
+  const [activeScreen, setActiveScreen] = useState<AppScreen>("capture");
   const [probe, setProbe] = useState<RuntimeProbe | null>(null);
   const [config, setConfig] = useState<CaptureConfig>({
     width: 1280,
     height: 720,
     fps: 30,
     backend: "realsense",
-    targetLabel: "mini_tomato",
+    targetLabel: "scan",
+    outputRoot: window.localStorage.getItem("agriscan.outputRoot") ?? "",
     cultivar: "",
     notes: "",
     maxFrames: null,
@@ -416,7 +425,6 @@ function App() {
 
       stopRecordingPolling();
       setLatestFrame(null);
-      setAssetResult(null);
       const session = await tauriCall<SessionStarted>("start_recording", { config });
       setRecording(true);
       setPreviewing(false);
@@ -545,9 +553,7 @@ function App() {
       stopLatestFrameAttach();
       setPreviewing(true);
       setPreviewLoading(true);
-      setActiveSession(null);
       setLatestFrame(null);
-      setAssetResult(null);
       setPrivilegedPreview(null);
 
       if (!isTauri) {
@@ -704,8 +710,83 @@ function App() {
     }
   };
 
+  const chooseSaveLocation = async () => {
+    if (!isTauri) {
+      setConfig((current) => ({ ...current, outputRoot: "/preview/3dscan" }));
+      return;
+    }
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: config.outputRoot || undefined,
+        title: "Select save location"
+      });
+      if (typeof selected === "string") {
+        setConfig((current) => ({ ...current, outputRoot: selected }));
+        pushLog(`save location: ${selected}`);
+      }
+    } catch (error) {
+      pushLog(`save location selection failed: ${String(error)}`);
+    }
+  };
+
+  const loadPreviewData = async () => {
+    if (!isTauri) {
+      pushLog("file loading is available in the desktop app");
+      return;
+    }
+    try {
+      const selected = await openDialog({
+        directory: false,
+        multiple: false,
+        defaultPath: config.outputRoot || undefined,
+        title: "Load 3D scan data",
+        filters: [
+          { name: "3D scan data", extensions: ["mcap", "mcp", "ply", "splat", "json"] }
+        ]
+      });
+      if (typeof selected !== "string") return;
+      setAssetBusy(true);
+      pushLog(`loading ${selected}`);
+      const result = await tauriCall<AssetBuildResult>("load_scan_data", { path: selected });
+      const sessionRoot = result.root.replace(/[\\/]assets$/, "");
+      const sessionId = sessionRoot.split(/[\\/]/).filter(Boolean).pop() ?? "loaded_scan";
+      setActiveSession({
+        sessionId,
+        root: sessionRoot,
+        backend: "loaded",
+        notice: "Loaded scan data",
+        progressPath: null
+      });
+      setAssetResult(result);
+      setActiveScreen("preview");
+      pushLog(`loaded ${result.pointCount.toLocaleString()} splats`);
+    } catch (error) {
+      pushLog(`load failed: ${String(error)}`);
+    } finally {
+      setAssetBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (config.outputRoot) {
+      window.localStorage.setItem("agriscan.outputRoot", config.outputRoot);
+    }
+  }, [config.outputRoot]);
+
   useEffect(() => {
     const boot = async () => {
+      if (isTauri && !config.outputRoot) {
+        try {
+          const saveLocation = await tauriCall<string>("default_save_location");
+          setConfig((current) =>
+            current.outputRoot ? current : { ...current, outputRoot: saveLocation }
+          );
+        } catch (error) {
+          pushLog(`default save location failed: ${String(error)}`);
+        }
+      }
       if (isTauri && !helperBootAttempted.current) {
         helperBootAttempted.current = true;
         setHelperInstallBusy(true);
@@ -788,109 +869,588 @@ function App() {
 
   const sdkBadgeVariant = probe?.sdkLoaded ? "success" : "warning";
   const deviceBadgeVariant = devices.length ? "success" : "warning";
+  const screenCopy = {
+    capture: {
+      title: "RGB-D Capture"
+    },
+    preview: {
+      title: "3D Preview"
+    },
+    settings: {
+      title: "Settings"
+    }
+  }[activeScreen];
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="sticky top-0 z-10 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-        <div className="flex h-[72px] items-center gap-4 px-5">
-          <div className="flex min-w-0 flex-1 items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-lg bg-primary text-sm font-bold text-primary-foreground">
-              TT
-            </div>
-            <div className="min-w-0">
-              <h1 className="truncate text-lg font-semibold tracking-normal">Tomato Twin Capture</h1>
-              <p className="truncate text-sm text-muted-foreground">RealSense RGB-D scan console</p>
-            </div>
-          </div>
+      <aside className="fixed inset-y-0 left-0 z-30 flex w-[92px] flex-col items-center border-r border-white/10 bg-[#0d3528] px-2.5 py-5 text-white shadow-2xl shadow-emerald-950/10">
+        <nav className="mt-1 flex w-full flex-col gap-3" aria-label="Primary navigation">
+          <SidebarButton
+            label="Capture"
+            icon={<ScanLine className="h-6 w-6" />}
+            active={activeScreen === "capture"}
+            onClick={() => setActiveScreen("capture")}
+          />
+          <SidebarButton
+            label="3D Preview"
+            icon={<Box className="h-6 w-6" />}
+            active={activeScreen === "preview"}
+            onClick={() => setActiveScreen("preview")}
+          />
+          <SidebarButton
+            label="Settings"
+            icon={<SlidersHorizontal className="h-6 w-6" />}
+            active={activeScreen === "settings"}
+            onClick={() => setActiveScreen("settings")}
+          />
+        </nav>
+      </aside>
 
-          <div className="hidden flex-wrap items-center justify-end gap-2 md:flex">
-            <Badge variant={sdkBadgeVariant}>
-              <Cpu className="h-3.5 w-3.5" />
-              {probe?.sdkLoaded ? `SDK ${probe.apiVersion ?? ""}` : "SDK missing"}
-            </Badge>
-            <Badge variant={deviceBadgeVariant}>
-              <Camera className="h-3.5 w-3.5" />
-              {devices.length ? `${devices.length} device` : "No device"}
-            </Badge>
-            <Badge variant={recording || previewing ? "live" : "outline"}>
-              {recording || previewing ? <Radio className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
-              {recording ? "Recording" : previewing ? "Live" : "Idle"}
-            </Badge>
-            {busyMessage ? (
-              <Badge variant="warning">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {busyMessage}
+      <div className="min-h-screen pl-[92px]">
+        <header className="sticky top-0 z-20 border-b border-black/[0.06] bg-background/92 backdrop-blur-xl">
+          <div className="flex min-h-[70px] items-center gap-5 px-6 2xl:px-8">
+            <div className="min-w-0 flex-1">
+              <h1 className="text-[22px] font-semibold tracking-[-0.025em]">{screenCopy.title}</h1>
+            </div>
+
+            <div className="hidden flex-wrap items-center justify-end gap-2 md:flex">
+              <Badge variant={sdkBadgeVariant}>
+                <Cpu className="h-3.5 w-3.5" />
+                {probe?.sdkLoaded ? `SDK ${probe.apiVersion ?? ""}` : "SDK missing"}
               </Badge>
-            ) : null}
-          </div>
+              <Badge variant={deviceBadgeVariant}>
+                <Camera className="h-3.5 w-3.5" />
+                {devices.length ? `${devices.length} device` : "No device"}
+              </Badge>
+              <Badge variant={recording || previewing ? "live" : "outline"}>
+                {recording || previewing ? <Radio className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
+                {recording ? "Recording" : previewing ? "Live" : "Idle"}
+              </Badge>
+            </div>
 
-          <Button size="icon" variant="outline" onClick={() => refreshProbe()} disabled={sdkSetupBusy || mlxSetupBusy || probeBusy} title="Refresh devices">
-            <RefreshCw className={cn("h-4 w-4", (sdkSetupBusy || mlxSetupBusy || probeBusy) && "animate-spin")} />
+            <Button
+              size="icon"
+              variant="outline"
+              className="rounded-xl bg-white"
+              onClick={() => refreshProbe()}
+              disabled={sdkSetupBusy || mlxSetupBusy || probeBusy}
+              title="Refresh devices"
+            >
+              <RefreshCw className={cn("h-4 w-4", (sdkSetupBusy || mlxSetupBusy || probeBusy) && "animate-spin")} />
+            </Button>
+          </div>
+        </header>
+
+        {busyMessage ? (
+          <div className="border-b border-amber-200/70 bg-amber-50 px-6 py-2.5 text-sm font-medium text-amber-950">
+            <div className="flex items-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>{busyMessage}</span>
+            </div>
+          </div>
+        ) : null}
+
+        <main className="p-5 2xl:p-7">
+          {activeScreen === "capture" ? (
+            <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+              <section className="min-w-0 space-y-5">
+                <LiveFramePanel
+                  latestFrame={latestFrame}
+                  activeSession={previewing ? previewSession : activeSession}
+                  previewing={previewing}
+                  recording={recording}
+                  loadingMessage={previewLoading ? busyMessage : null}
+                />
+                <CaptureStatusCards
+                  activeSession={previewing ? previewSession : activeSession}
+                  latestFrame={latestFrame}
+                  backend={backend}
+                  deviceCount={devices.length}
+                  log={log}
+                  revealSession={() => revealPath(activeSession?.root)}
+                />
+              </section>
+              <CaptureCommandPanel
+                config={config}
+                setConfig={setConfig}
+                backend={backend}
+                recording={recording}
+                previewing={previewing}
+                previewLoading={previewLoading}
+                captureStarting={captureStarting}
+                captureStopping={captureStopping}
+                activeSession={activeSession}
+                latestFrame={latestFrame}
+                helperReady={helperReady}
+                startPreview={startPreview}
+                stopPreview={stopPreview}
+                startCapture={startCapture}
+                stopCapture={stopCapture}
+                chooseSaveLocation={chooseSaveLocation}
+              />
+            </div>
+          ) : null}
+
+          {activeScreen === "preview" ? (
+            <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+              <AssetPreviewPanel
+                assetResult={assetResult}
+                assetBusy={assetBusy}
+                loadPreviewData={loadPreviewData}
+              />
+              <AssetCommandPanel
+                assetResult={assetResult}
+                assetBusy={assetBusy}
+                activeSession={activeSession}
+                assetOptions={assetOptions}
+                setAssetOptions={setAssetOptions}
+                recording={recording}
+                generateAssets={generateAssets}
+                revealAssets={() => revealPath(assetResult?.root)}
+              />
+            </div>
+          ) : null}
+
+          {activeScreen === "settings" ? (
+            <div className="grid items-start gap-5 xl:grid-cols-[minmax(380px,0.85fr)_minmax(480px,1.15fr)]">
+              <ControlPanel
+                config={config}
+                setConfig={setConfig}
+                assetOptions={assetOptions}
+                setAssetOptions={setAssetOptions}
+                backend={backend}
+                recording={recording}
+                previewing={previewing}
+                previewLoading={previewLoading}
+                captureStarting={captureStarting}
+                captureStopping={captureStopping}
+                assetBusy={assetBusy}
+                activeSession={activeSession}
+                previewSession={previewSession}
+                startPreview={startPreview}
+                stopPreview={stopPreview}
+                startCapture={startCapture}
+                stopCapture={stopCapture}
+                generateAssets={generateAssets}
+                assetTools={assetTools}
+                helperReady={helperReady}
+                chooseSaveLocation={chooseSaveLocation}
+                settingsOnly
+              />
+              <OutputPanel
+                activeSession={activeSession}
+                latestFrame={latestFrame}
+                devices={devices}
+                probe={probe}
+                assetResult={assetResult}
+                log={log}
+                setupSdk={setupSdk}
+                setupMlx3dgs={setupMlx3dgs}
+                installHelper={installHelper}
+                sdkSetupBusy={sdkSetupBusy}
+                mlxSetupBusy={mlxSetupBusy}
+                helperInstallBusy={helperInstallBusy}
+                helperStatus={helperStatus}
+                recording={recording}
+                revealSession={() => revealPath(activeSession?.root)}
+              />
+            </div>
+          ) : null}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function SidebarButton({
+  label,
+  icon,
+  active,
+  onClick
+}: {
+  label: string;
+  icon: React.ReactNode;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-current={active ? "page" : undefined}
+      onClick={onClick}
+      className={cn(
+        "group relative flex min-h-[76px] w-full flex-col items-center justify-center gap-2 rounded-2xl px-1 text-[10px] font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80",
+        active
+          ? "bg-white/16 text-white shadow-[inset_0_0_0_1px_rgb(255_255_255/0.18),0_12px_30px_rgb(0_0_0/0.14)]"
+          : "text-white/62 hover:bg-white/8 hover:text-white"
+      )}
+    >
+      <span
+        className={cn(
+          "absolute -left-2.5 h-8 w-1 rounded-r-full bg-[#a6d89a] transition-opacity",
+          active ? "opacity-100" : "opacity-0"
+        )}
+      />
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function CaptureCommandPanel(props: {
+  config: CaptureConfig;
+  setConfig: React.Dispatch<React.SetStateAction<CaptureConfig>>;
+  backend: string;
+  recording: boolean;
+  previewing: boolean;
+  previewLoading: boolean;
+  captureStarting: boolean;
+  captureStopping: boolean;
+  activeSession: SessionStarted | null;
+  latestFrame: FrameSummary | null;
+  helperReady: boolean;
+  startPreview: () => void;
+  stopPreview: () => void;
+  startCapture: () => void;
+  stopCapture: () => void;
+  chooseSaveLocation: () => void;
+}) {
+  const disabled = props.recording || props.previewing || props.captureStarting || props.captureStopping;
+  const selectedProfileIndex = CAPTURE_PROFILES.findIndex(
+    (profile) =>
+      profile.width === props.config.width &&
+      profile.height === props.config.height &&
+      profile.fps === props.config.fps
+  );
+  const selectedProfileValue = selectedProfileIndex >= 0 ? String(selectedProfileIndex) : "custom";
+  const updateConfig = <K extends keyof CaptureConfig>(key: K, value: CaptureConfig[K]) => {
+    props.setConfig((current) => ({ ...current, [key]: value }));
+  };
+  const applyProfile = (value: string) => {
+    const profile = CAPTURE_PROFILES[Number(value)] ?? CAPTURE_PROFILES[0];
+    props.setConfig((current) => ({
+      ...current,
+      width: profile.width,
+      height: profile.height,
+      fps: profile.fps
+    }));
+  };
+  const recordDisabled =
+    props.recording ||
+    props.previewing ||
+    props.captureStarting ||
+    props.captureStopping ||
+    !props.helperReady;
+
+  return (
+    <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-[0_18px_55px_rgb(24_53_40/0.08)] xl:sticky xl:top-[105px]">
+      <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] px-5 py-5">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <CardTitle>Capture Control</CardTitle>
+            <CardDescription className="mt-1">Backend: {props.backend}</CardDescription>
+          </div>
+          <Badge variant={props.recording || props.previewing ? "live" : "outline"}>
+            {props.recording || props.previewing ? <Radio className="h-3.5 w-3.5" /> : <Circle className="h-3.5 w-3.5" />}
+            {props.recording ? "Recording" : props.previewing ? "Live" : "Ready"}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-5 p-5">
+        <div className="grid grid-cols-3 gap-3">
+          <Button
+            variant="outline"
+            className="h-11 rounded-xl bg-white"
+            onClick={props.previewing ? props.stopPreview : props.startPreview}
+            disabled={props.recording || props.captureStarting || props.captureStopping || !props.helperReady}
+          >
+            {props.previewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+            {props.previewLoading ? "Opening" : props.previewing ? "Stop Live" : "Live Preview"}
+          </Button>
+          <Button
+            className="h-11 rounded-xl"
+            onClick={props.startCapture}
+            disabled={recordDisabled}
+            aria-label="Record RGB-D"
+          >
+            {props.captureStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
+            {props.captureStarting ? "Opening" : "Record"}
+          </Button>
+          <Button
+            variant="destructive"
+            className="h-11 rounded-xl"
+            onClick={props.stopCapture}
+            disabled={!props.recording || props.captureStopping}
+          >
+            {props.captureStopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+            {props.captureStopping ? "Stopping" : "Stop"}
           </Button>
         </div>
-      </header>
-      {busyMessage ? (
-        <div className="border-b bg-amber-50 px-4 py-2 text-sm font-medium text-amber-900">
-          <div className="flex items-center gap-2">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            <span>{busyMessage}</span>
+
+        <div className="h-px bg-border/70" />
+
+        <Field label="Capture profile">
+          <Select value={selectedProfileValue} disabled={disabled} onChange={(event) => applyProfile(event.target.value)}>
+            {selectedProfileIndex < 0 ? (
+              <option value="custom">
+                Custom: {props.config.width} x {props.config.height} / {props.config.fps} fps
+              </option>
+            ) : null}
+            {CAPTURE_PROFILES.map((profile, index) => (
+              <option key={`${profile.width}-${profile.height}-${profile.fps}`} value={index}>
+                {profile.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="File name">
+          <Input
+            value={props.config.targetLabel}
+            placeholder="scan"
+            disabled={disabled}
+            onChange={(event) => updateConfig("targetLabel", event.target.value)}
+          />
+        </Field>
+        <Field label="Save location">
+          <div className="flex gap-2">
+            <Input value={props.config.outputRoot} placeholder="Select a folder" readOnly />
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              disabled={disabled}
+              onClick={props.chooseSaveLocation}
+              title="Select save location"
+              aria-label="Select save location"
+            >
+              <FolderOpen className="h-4 w-4" />
+            </Button>
+          </div>
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <NumberField
+            label="Max frames"
+            value={props.config.maxFrames ?? 0}
+            min={0}
+            max={100000}
+            disabled={disabled}
+            onChange={(value) => updateConfig("maxFrames", value > 0 ? value : null)}
+          />
+          <Field label="Mode">
+            <Select
+              value={props.config.backend}
+              disabled={disabled}
+              onChange={(event) => updateConfig("backend", event.target.value as BackendMode)}
+            >
+              <option value="auto">Auto</option>
+              <option value="realsense">RealSense</option>
+              <option value="synthetic">Demo</option>
+            </Select>
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 rounded-xl border bg-muted/25 p-3">
+          <div>
+            <div className="text-[11px] font-medium text-muted-foreground">Frames</div>
+            <div className="mt-1 text-xl font-semibold tabular-nums">{props.latestFrame?.frameIndex ?? 0}</div>
+          </div>
+          <div className="border-l pl-3">
+            <div className="text-[11px] font-medium text-muted-foreground">Session</div>
+            <div className="mt-1 truncate text-sm font-semibold">{props.activeSession?.sessionId ?? "Not started"}</div>
           </div>
         </div>
-      ) : null}
+        {!props.helperReady ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-950">
+            Capture helper is not ready. Open Settings to prepare the device once.
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
+  );
+}
 
-      <main className="grid gap-4 p-4 xl:grid-cols-[340px_minmax(520px,1fr)_360px]">
-        <ControlPanel
-          config={config}
-          setConfig={setConfig}
-          assetOptions={assetOptions}
-          setAssetOptions={setAssetOptions}
-          backend={backend}
-          recording={recording}
-          previewing={previewing}
-          previewLoading={previewLoading}
-          captureStarting={captureStarting}
-          captureStopping={captureStopping}
-          assetBusy={assetBusy}
-          activeSession={activeSession}
-          previewSession={previewSession}
-          startPreview={startPreview}
-          stopPreview={stopPreview}
-          startCapture={startCapture}
-          stopCapture={stopCapture}
-          generateAssets={generateAssets}
-          assetTools={assetTools}
-          helperReady={helperReady}
-        />
+function CaptureStatusCards({
+  activeSession,
+  latestFrame,
+  backend,
+  deviceCount,
+  log,
+  revealSession
+}: {
+  activeSession: SessionStarted | null;
+  latestFrame: FrameSummary | null;
+  backend: string;
+  deviceCount: number;
+  log: string[];
+  revealSession: () => void;
+}) {
+  return (
+    <div className="grid gap-4 lg:grid-cols-3">
+      <Card className="rounded-2xl border-black/[0.06] shadow-none">
+        <CardContent className="p-4">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+            Session Status
+          </div>
+          <dl className="mt-4 space-y-2.5 text-xs">
+            <StatusRow label="Backend" value={backend} />
+            <StatusRow label="Device" value={deviceCount ? `${deviceCount} connected` : "Not connected"} />
+            <StatusRow label="Frame no." value={latestFrame ? String(latestFrame.frameNumber) : "0"} />
+          </dl>
+        </CardContent>
+      </Card>
+      <Card className="rounded-2xl border-black/[0.06] shadow-none">
+        <CardContent className="p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              <HardDrive className="h-4 w-4 text-primary" />
+              MCAP Recording
+            </div>
+            <Button size="icon" variant="ghost" className="h-8 w-8" disabled={!activeSession?.root} onClick={revealSession}>
+              <FolderOpen className="h-4 w-4" />
+            </Button>
+          </div>
+          <div className="mt-4 rounded-lg bg-muted/40 px-3 py-2">
+            <div className="text-[11px] font-medium text-muted-foreground">Session path</div>
+            <div className="mt-1 truncate text-xs" title={activeSession?.root ?? ""}>
+              {shortPath(activeSession?.root ?? "-")}
+            </div>
+          </div>
+          <div className="mt-3 text-xs text-muted-foreground">
+            {latestFrame?.depth.validPoints.toLocaleString() ?? "0"} valid depth points in the latest frame
+          </div>
+        </CardContent>
+      </Card>
+      <Card className="rounded-2xl border-black/[0.06] shadow-none">
+        <CardContent className="p-4">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <Activity className="h-4 w-4 text-primary" />
+            Recent Activity
+          </div>
+          <ol className="mt-4 space-y-2.5">
+            {log.slice(0, 3).map((line, index) => (
+              <li key={`${line}-${index}`} className="flex gap-2 text-[11px] leading-4 text-muted-foreground">
+                <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+                <span className="line-clamp-2">{line}</span>
+              </li>
+            ))}
+            {!log.length ? <li className="text-xs text-muted-foreground">Waiting for activity</li> : null}
+          </ol>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
 
-        <section className="min-h-0 space-y-4">
-          <LiveFramePanel
-            latestFrame={latestFrame}
-            activeSession={activeSession ?? previewSession}
-            previewing={previewing}
-            recording={recording}
-            loadingMessage={previewLoading ? busyMessage : null}
-          />
-          <AssetPreviewPanel assetResult={assetResult} assetBusy={assetBusy} revealAssets={() => revealPath(assetResult?.root)} />
-        </section>
+function AssetCommandPanel(props: {
+  assetResult: AssetBuildResult | null;
+  assetBusy: boolean;
+  activeSession: SessionStarted | null;
+  assetOptions: AssetOptions;
+  setAssetOptions: React.Dispatch<React.SetStateAction<AssetOptions>>;
+  recording: boolean;
+  generateAssets: () => void;
+  revealAssets: () => void;
+}) {
+  const updateAsset = <K extends keyof AssetOptions>(key: K, value: AssetOptions[K]) => {
+    props.setAssetOptions((current) => ({ ...current, [key]: value }));
+  };
+  return (
+    <aside className="space-y-5 xl:sticky xl:top-[105px]">
+      <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-[0_18px_55px_rgb(24_53_40/0.08)]">
+        <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] px-5 py-5">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <CardTitle>Build Assets</CardTitle>
+            </div>
+            <WandSparkles className="h-5 w-5 text-primary" />
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-5 p-5">
+          <div className="grid grid-cols-2 gap-3">
+            <NumberField
+              label="Max splats"
+              value={props.assetOptions.maxPoints}
+              min={5000}
+              max={1500000}
+              step={1000}
+              onChange={(value) => updateAsset("maxPoints", value)}
+            />
+            <NumberField
+              label="Frame step"
+              value={props.assetOptions.frameStride}
+              min={1}
+              max={24}
+              onChange={(value) => updateAsset("frameStride", value)}
+            />
+          </div>
+          <label className="flex items-center justify-between rounded-xl border bg-muted/25 p-3 text-sm">
+            <span className="font-medium">MLX refinement</span>
+            <input
+              className="h-4 w-4 rounded border-input accent-emerald-700"
+              type="checkbox"
+              checked={props.assetOptions.useMlx}
+              onChange={(event) => updateAsset("useMlx", event.target.checked)}
+            />
+          </label>
+          <label className="flex items-center justify-between rounded-xl border bg-muted/25 p-3 text-sm">
+            <span className="font-medium">Native FBX export</span>
+            <input
+              className="h-4 w-4 rounded border-input accent-emerald-700"
+              type="checkbox"
+              checked={props.assetOptions.exportFbx}
+              onChange={(event) => updateAsset("exportFbx", event.target.checked)}
+            />
+          </label>
+          <Button
+            className="h-12 w-full rounded-xl"
+            onClick={props.generateAssets}
+            disabled={!props.activeSession || props.recording || props.assetBusy}
+          >
+            {props.assetBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Box className="h-4 w-4" />}
+            {props.assetBusy ? "Generating assets" : "Generate assets"}
+          </Button>
+        </CardContent>
+      </Card>
 
-        <OutputPanel
-          activeSession={activeSession}
-          latestFrame={latestFrame}
-          devices={devices}
-          probe={probe}
-          assetResult={assetResult}
-          log={log}
-          setupSdk={setupSdk}
-          setupMlx3dgs={setupMlx3dgs}
-          installHelper={installHelper}
-          sdkSetupBusy={sdkSetupBusy}
-          mlxSetupBusy={mlxSetupBusy}
-          helperInstallBusy={helperInstallBusy}
-          helperStatus={helperStatus}
-          recording={recording}
-          revealSession={() => revealPath(activeSession?.root)}
-        />
-      </main>
+      <Card className="rounded-2xl border-black/[0.06] shadow-none">
+        <CardHeader className="border-b border-black/[0.06] pb-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <CardTitle>Asset Summary</CardTitle>
+            </div>
+            <Button
+              size="icon"
+              variant="outline"
+              disabled={!props.assetResult}
+              onClick={props.revealAssets}
+              title="Open assets folder"
+              aria-label="Open assets folder"
+            >
+              <FolderOpen className="h-4 w-4" />
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 pt-4">
+          <div className="grid grid-cols-2 gap-3">
+            <Stat label="Gaussians" value={props.assetResult?.pointCount.toLocaleString() ?? "0"} />
+            <Stat label="Mesh faces" value={props.assetResult?.faceCount.toLocaleString() ?? "0"} />
+          </div>
+          <PathRow label="3DGS PLY" value={props.assetResult?.gaussianPly ?? "-"} />
+          <PathRow label="FBX" value={props.assetResult?.meshFbx ?? props.assetResult?.fbxStatus ?? "-"} />
+          <PathRow label="Collider" value={props.assetResult?.colliderObj ?? "-"} />
+        </CardContent>
+      </Card>
+    </aside>
+  );
+}
+
+function StatusRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="truncate font-medium">{value}</dd>
     </div>
   );
 }
@@ -916,6 +1476,8 @@ function ControlPanel(props: {
   generateAssets: () => void;
   assetTools: AssetTools | null;
   helperReady: boolean;
+  chooseSaveLocation: () => void;
+  settingsOnly?: boolean;
 }) {
   const disabled = props.recording || props.previewing || props.captureStarting || props.captureStopping;
   const selectedProfileIndex = CAPTURE_PROFILES.findIndex(
@@ -940,19 +1502,19 @@ function ControlPanel(props: {
   };
 
   return (
-    <Card className="h-fit xl:sticky xl:top-[88px]">
-      <CardHeader className="border-b pb-4">
+    <Card className="h-fit overflow-hidden rounded-2xl border-black/[0.07] shadow-[0_18px_55px_rgb(24_53_40/0.07)]">
+      <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] px-5 py-5">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <CardTitle>Capture</CardTitle>
-            <CardDescription>Backend: {props.backend}</CardDescription>
+            <CardTitle>{props.settingsOnly ? "Capture & Reconstruction" : "Capture"}</CardTitle>
+            <CardDescription className="mt-1">Backend: {props.backend}</CardDescription>
           </div>
           <Badge variant="secondary">
             {props.config.width}x{props.config.height} / {props.config.fps}fps
           </Badge>
         </div>
       </CardHeader>
-      <CardContent className="space-y-5 pt-4">
+      <CardContent className="space-y-5 p-5">
         <Field label="Capture profile">
           <Select value={selectedProfileValue} disabled={disabled} onChange={(event) => applyProfile(event.target.value)}>
             {selectedProfileIndex < 0 ? <option value="custom">Custom: {props.config.width} x {props.config.height} / {props.config.fps} fps</option> : null}
@@ -984,13 +1546,34 @@ function ControlPanel(props: {
         </Field>
 
         <div className="grid grid-cols-2 gap-3">
-          <NumberField label="PLY stride" value={props.config.pointStride} min={1} max={12} disabled={disabled} onChange={(v) => updateConfig("pointStride", v)} />
+          <NumberField label="Point stride" value={props.config.pointStride} min={1} max={12} disabled={disabled} onChange={(v) => updateConfig("pointStride", v)} />
           <NumberField label="Min depth" value={props.config.minDepthM} min={0.02} max={4} step={0.01} disabled={disabled} onChange={(v) => updateConfig("minDepthM", v)} />
           <NumberField label="Max depth" value={props.config.maxDepthM} min={0.03} max={8} step={0.01} disabled={disabled} onChange={(v) => updateConfig("maxDepthM", v)} />
         </div>
 
-        <Field label="Target">
-          <Input value={props.config.targetLabel} disabled={disabled} onChange={(event) => updateConfig("targetLabel", event.target.value)} />
+        <Field label="File name">
+          <Input
+            value={props.config.targetLabel}
+            placeholder="scan"
+            disabled={disabled}
+            onChange={(event) => updateConfig("targetLabel", event.target.value)}
+          />
+        </Field>
+        <Field label="Save location">
+          <div className="flex gap-2">
+            <Input value={props.config.outputRoot} placeholder="Select a folder" readOnly />
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              disabled={disabled}
+              onClick={props.chooseSaveLocation}
+              title="Select save location"
+              aria-label="Select save location"
+            >
+              <FolderOpen className="h-4 w-4" />
+            </Button>
+          </div>
         </Field>
         <Field label="Cultivar">
           <Input value={props.config.cultivar} placeholder="optional" disabled={disabled} onChange={(event) => updateConfig("cultivar", event.target.value)} />
@@ -1009,27 +1592,29 @@ function ControlPanel(props: {
           <Textarea value={props.config.notes} disabled={disabled} onChange={(event) => updateConfig("notes", event.target.value)} />
         </Field>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Button
-            variant="secondary"
-            onClick={props.previewing ? props.stopPreview : props.startPreview}
-            disabled={props.recording || props.captureStarting || props.captureStopping || !props.helperReady}
-          >
-            {props.previewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-            {props.previewLoading ? "Loading Preview" : props.previewing ? "Stop Live" : "Live Preview"}
-          </Button>
-          <Button
-            onClick={props.startCapture}
-            disabled={props.recording || props.previewing || props.captureStarting || !props.helperReady}
-          >
-            {props.captureStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
-            {props.captureStarting ? "Loading Record" : "Record RGB-D"}
-          </Button>
-          <Button className="col-span-2" variant="destructive" onClick={props.stopCapture} disabled={!props.recording || props.captureStopping}>
-            {props.captureStopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
-            {props.captureStopping ? "Loading Stop" : "Stop Recording"}
-          </Button>
-        </div>
+        {!props.settingsOnly ? (
+          <div className="grid grid-cols-2 gap-3">
+            <Button
+              variant="secondary"
+              onClick={props.previewing ? props.stopPreview : props.startPreview}
+              disabled={props.recording || props.captureStarting || props.captureStopping || !props.helperReady}
+            >
+              {props.previewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+              {props.previewLoading ? "Loading Preview" : props.previewing ? "Stop Live" : "Live Preview"}
+            </Button>
+            <Button
+              onClick={props.startCapture}
+              disabled={props.recording || props.previewing || props.captureStarting || !props.helperReady}
+            >
+              {props.captureStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
+              {props.captureStarting ? "Loading Record" : "Record RGB-D"}
+            </Button>
+            <Button className="col-span-2" variant="destructive" onClick={props.stopCapture} disabled={!props.recording || props.captureStopping}>
+              {props.captureStopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
+              {props.captureStopping ? "Loading Stop" : "Stop Recording"}
+            </Button>
+          </div>
+        ) : null}
 
         <div className="rounded-lg border bg-muted/35 p-3">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -1073,10 +1658,12 @@ function ControlPanel(props: {
               Export FBX
             </label>
           </div>
-          <Button className="mt-3 w-full" variant="secondary" onClick={props.generateAssets} disabled={!props.activeSession || props.recording || props.assetBusy}>
-            {props.assetBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Box className="h-4 w-4" />}
-            {props.assetBusy ? "Generating" : "Generate assets"}
-          </Button>
+          {!props.settingsOnly ? (
+            <Button className="mt-3 w-full" variant="secondary" onClick={props.generateAssets} disabled={!props.activeSession || props.recording || props.assetBusy}>
+              {props.assetBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Box className="h-4 w-4" />}
+              {props.assetBusy ? "Generating" : "Generate assets"}
+            </Button>
+          ) : null}
         </div>
       </CardContent>
     </Card>
@@ -1097,26 +1684,36 @@ function LiveFramePanel({
   loadingMessage: string | null;
 }) {
   return (
-    <Card>
-      <CardHeader className="border-b pb-4">
+    <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-[0_18px_55px_rgb(24_53_40/0.07)]">
+      <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] px-5 py-5">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <CardTitle>Live Frames</CardTitle>
-            <CardDescription>
+            <CardTitle>Live RGB-D</CardTitle>
+            <CardDescription className="mt-1">
               {recording ? "recording" : previewing ? "previewing" : "idle"} / {activeSession?.sessionId ?? "no session"}
             </CardDescription>
           </div>
-          <div className="rounded-md border bg-muted px-3 py-2 text-right">
+          <div className="rounded-xl border bg-white px-3 py-2 text-right shadow-sm">
             <div className="text-lg font-semibold leading-none">{latestFrame?.frameIndex ?? 0}</div>
             <div className="text-xs text-muted-foreground">frames</div>
           </div>
         </div>
       </CardHeader>
-      <CardContent className="space-y-4 pt-4">
+      <CardContent className="space-y-4 p-5">
         <div className="relative">
           <div className="grid gap-3 lg:grid-cols-2">
-            <PreviewPane label="RGB" src={latestFrame?.colorPreviewDataUrl ?? null} icon={<Camera className="h-7 w-7" />} />
-            <PreviewPane label="Depth" src={latestFrame?.depthPreviewDataUrl ?? null} icon={<ScanLine className="h-7 w-7" />} />
+            <PreviewPane
+              label="RGB"
+              src={latestFrame?.colorPreviewDataUrl ?? null}
+              icon={<Camera className="h-7 w-7" />}
+              active={previewing || recording}
+            />
+            <PreviewPane
+              label="Depth"
+              src={latestFrame?.depthPreviewDataUrl ?? null}
+              icon={<ScanLine className="h-7 w-7" />}
+              active={previewing || recording}
+            />
           </div>
           {loadingMessage ? (
             <div className="absolute inset-0 grid place-items-center rounded-lg border bg-background/80 backdrop-blur-sm">
@@ -1144,30 +1741,39 @@ function LiveFramePanel({
 function AssetPreviewPanel({
   assetResult,
   assetBusy,
-  revealAssets
+  loadPreviewData
 }: {
   assetResult: AssetBuildResult | null;
   assetBusy: boolean;
-  revealAssets: () => void;
+  loadPreviewData: () => void;
 }) {
   return (
-    <Card>
-      <CardHeader className="border-b pb-4">
+    <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-[0_18px_55px_rgb(24_53_40/0.07)]">
+      <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] px-5 py-5">
         <div className="flex items-center justify-between gap-3">
           <div>
             <CardTitle>3DGS Preview</CardTitle>
-            <CardDescription>
-              {assetResult
-                ? `${assetResult.pointCount.toLocaleString()} gaussians / ${assetResult.faceCount.toLocaleString()} faces`
-                : "generate assets after capture"}
-            </CardDescription>
           </div>
-          <Button size="icon" variant="outline" disabled={!assetResult} onClick={revealAssets} title="Open assets folder">
+          <div className="flex items-center gap-3">
+            {assetResult ? (
+              <span className="text-xs font-medium tabular-nums text-muted-foreground">
+                {assetResult.pointCount.toLocaleString()} splats · {assetResult.faceCount.toLocaleString()} faces
+              </span>
+            ) : null}
+            <Button
+              size="icon"
+              variant="outline"
+              disabled={assetBusy}
+              onClick={loadPreviewData}
+              title="Load 3D scan data"
+              aria-label="Load 3D scan data"
+            >
             <FolderOpen className="h-4 w-4" />
-          </Button>
+            </Button>
+          </div>
         </div>
       </CardHeader>
-      <CardContent className="pt-4">
+      <CardContent className="p-5">
         <div className="relative">
           <SplatCanvas payload={assetResult?.preview ?? null} />
           {assetBusy ? (
@@ -1205,13 +1811,12 @@ function OutputPanel(props: {
   revealSession: () => void;
 }) {
   return (
-    <aside className="space-y-4 xl:sticky xl:top-[88px] xl:h-fit">
-      <Card>
-        <CardHeader className="border-b pb-4">
+    <aside className="space-y-5 xl:h-fit">
+      <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-none">
+        <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] pb-4">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <CardTitle>Dataset</CardTitle>
-              <CardDescription>Capture output</CardDescription>
+              <CardTitle>MCAP Recording</CardTitle>
             </div>
             <Button size="icon" variant="outline" disabled={!props.activeSession} onClick={props.revealSession}>
               <FolderOpen className="h-4 w-4" />
@@ -1220,17 +1825,16 @@ function OutputPanel(props: {
         </CardHeader>
         <CardContent className="space-y-2 pt-4">
           <PathRow label="Root" value={props.activeSession?.root ?? "-"} />
-          <PathRow label="RGB" value={props.latestFrame?.paths.rgb ?? "-"} />
-          <PathRow label="Depth" value={props.latestFrame?.paths.depth ?? "-"} />
-          <PathRow label="PLY" value={props.latestFrame?.paths.pointCloud ?? "-"} />
-          <PathRow label="Metadata" value={props.latestFrame?.paths.metadata ?? "-"} />
+          <PathRow label="RGB topic" value={props.latestFrame?.paths.rgb ?? "-"} />
+          <PathRow label="Depth topic" value={props.latestFrame?.paths.depth ?? "-"} />
+          <PathRow label="Point cloud topic" value={props.latestFrame?.paths.pointCloud ?? "-"} />
+          <PathRow label="Frame info topic" value={props.latestFrame?.paths.metadata ?? "-"} />
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="border-b pb-4">
+      <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-none">
+        <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] pb-4">
           <CardTitle>Assets</CardTitle>
-          <CardDescription>MLX 3DGS, mesh, collision and FBX</CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 pt-4">
           <PathRow label="Seed PLY" value={props.assetResult?.seedGaussianPly ?? "-"} />
@@ -1245,10 +1849,9 @@ function OutputPanel(props: {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="border-b pb-4">
+      <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-none">
+        <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] pb-4">
           <CardTitle>Device</CardTitle>
-          <CardDescription>SDK and connected cameras</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 pt-4">
           <Button className="w-full" variant="secondary" onClick={props.setupSdk} disabled={props.sdkSetupBusy || props.recording}>
@@ -1314,10 +1917,9 @@ function OutputPanel(props: {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="border-b pb-4">
+      <Card className="overflow-hidden rounded-2xl border-black/[0.07] shadow-none">
+        <CardHeader className="border-b border-black/[0.06] bg-[#fbfcf9] pb-4">
           <CardTitle>Log</CardTitle>
-          <CardDescription>Recent events</CardDescription>
         </CardHeader>
         <CardContent className="pt-4">
           <ol className="space-y-2">
@@ -1370,9 +1972,19 @@ function NumberField(props: {
   );
 }
 
-function PreviewPane({ label, src, icon }: { label: string; src: string | null; icon: React.ReactNode }) {
+function PreviewPane({
+  label,
+  src,
+  icon,
+  active
+}: {
+  label: string;
+  src: string | null;
+  icon: React.ReactNode;
+  active: boolean;
+}) {
   return (
-    <figure className="overflow-hidden rounded-lg border bg-zinc-950">
+    <figure className="relative overflow-hidden rounded-2xl border border-black/10 bg-[#111815] shadow-inner">
       <div className="grid aspect-[4/3] place-items-center">
         {src ? (
           <img key={src.slice(0, 96)} src={src} alt={`${label} preview`} className="h-full w-full object-contain" />
@@ -1383,14 +1995,20 @@ function PreviewPane({ label, src, icon }: { label: string; src: string | null; 
           </div>
         )}
       </div>
-      <figcaption className="border-t border-white/10 px-3 py-2 text-sm font-medium text-zinc-200">{label}</figcaption>
+      <figcaption className="absolute left-3 top-3 flex items-center gap-2 rounded-lg bg-black/60 px-2.5 py-1.5 text-xs font-semibold text-white backdrop-blur">
+        {label}
+        <span className={cn("flex items-center gap-1 text-[9px] font-medium", active ? "text-emerald-300" : "text-zinc-300")}>
+          <span className={cn("h-1.5 w-1.5 rounded-full", active ? "bg-emerald-400" : "bg-zinc-400")} />
+          {active ? "LIVE" : src ? "FRAME" : "WAITING"}
+        </span>
+      </figcaption>
     </figure>
   );
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border bg-muted/30 p-3">
+    <div className="rounded-xl border border-black/[0.06] bg-muted/25 p-3">
       <div className="text-xs font-medium text-muted-foreground">{label}</div>
       <div className="mt-1 truncate text-lg font-semibold">{value}</div>
     </div>
@@ -1399,7 +2017,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 function PathRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-md border bg-background px-3 py-2">
+    <div className="rounded-xl border border-black/[0.06] bg-background px-3 py-2.5">
       <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
       <dd title={value} className="mt-1 truncate text-sm">
         {shortPath(value)}
@@ -1653,10 +2271,10 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       <canvas
         ref={canvasRef}
         width={1000}
-        height={430}
+        height={620}
         tabIndex={0}
         aria-label="Interactive 3D Gaussian preview. Drag to rotate, use the mouse wheel to zoom, and use W A S D Q E to move."
-        className="h-[430px] w-full touch-none rounded-lg border bg-zinc-950 cursor-grab outline-none active:cursor-grabbing focus:ring-2 focus:ring-primary focus:ring-offset-2"
+        className="h-[calc(100vh-220px)] min-h-[520px] max-h-[760px] w-full touch-none cursor-grab rounded-2xl border border-black/15 bg-zinc-950 outline-none active:cursor-grabbing focus:ring-2 focus:ring-primary focus:ring-offset-2"
       />
       <div className="pointer-events-none absolute bottom-3 left-3 rounded bg-black/55 px-2 py-1 text-[11px] text-zinc-300">
         {rendererError ??
@@ -1788,6 +2406,9 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   if (command === "load_latest_scan_assets") {
     return null as T;
   }
+  if (command === "default_save_location") {
+    return "/preview/3dscan" as T;
+  }
   if (command === "probe_runtime") {
     return {
       sdkLoaded: false,
@@ -1865,18 +2486,18 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       paths: { rgb: null, depth: "-", pointCloud: "-", metadata: "-" }
     } as T;
   }
-  if (command === "generate_scan_assets") {
+  if (command === "generate_scan_assets" || command === "load_scan_data") {
     const points = mockPreviewPoints();
     return {
       root: "/preview/assets",
-      seedGaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_seed.ply",
-      gaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.ply",
-      splat: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.splat",
-      meshObj: "/preview/assets/mesh/tomato_surface.obj",
-      meshFbx: "/preview/assets/mesh/tomato_surface.fbx",
-      colliderObj: "/preview/assets/mesh/tomato_collider.obj",
-      collisionJson: "/preview/assets/mesh/tomato_collision.json",
-      collisionFbx: "/preview/assets/mesh/tomato_surface.fbx",
+      seedGaussianPly: "/preview/assets/gaussian_splats/scan_gaussians_seed.ply",
+      gaussianPly: "/preview/assets/gaussian_splats/scan_gaussians_mlx.ply",
+      splat: "/preview/assets/gaussian_splats/scan_gaussians_mlx.splat",
+      meshObj: "/preview/assets/mesh/scan_surface.obj",
+      meshFbx: "/preview/assets/mesh/scan_surface.fbx",
+      colliderObj: "/preview/assets/mesh/scan_collider.obj",
+      collisionJson: "/preview/assets/mesh/scan_collision.json",
+      collisionFbx: "/preview/assets/mesh/scan_surface.fbx",
       previewJson: "/preview/assets/preview/preview_points.json",
       manifest: "/preview/assets/asset_manifest.json",
       pointCount: points.length,
@@ -1929,10 +2550,10 @@ function startMockFrames(
         meanM: 0.48
       },
       paths: {
-        rgb: `${session.root}/rgb/frame_${String(frame).padStart(6, "0")}_rgb.png`,
-        depth: `${session.root}/depth_z16/frame_${String(frame).padStart(6, "0")}_depth_z16.png`,
-        pointCloud: `${session.root}/pointcloud_ply/frame_${String(frame).padStart(6, "0")}_cloud.ply`,
-        metadata: `${session.root}/metadata/frame_${String(frame).padStart(6, "0")}.json`
+        rgb: `${session.root}/${config.targetLabel || "scan"}.mcap#/camera/color/image/compressed`,
+        depth: `${session.root}/${config.targetLabel || "scan"}.mcap#/camera/depth/image_raw`,
+        pointCloud: `${session.root}/${config.targetLabel || "scan"}.mcap#/camera/depth/color/points`,
+        metadata: `${session.root}/${config.targetLabel || "scan"}.mcap#/agriscan/frame_info`
       }
     });
   }, 1000 / Math.max(1, config.fps));

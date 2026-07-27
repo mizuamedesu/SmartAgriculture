@@ -16,7 +16,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::{realsense, storage};
 
-pub(crate) const REALSENSE_HELPER_PROTOCOL: &str = "tomato-twin-realsense-helper-v1";
+pub(crate) const REALSENSE_HELPER_PROTOCOL: &str = "agriscan-realsense-helper-mcap-v2";
 
 #[derive(Default)]
 pub struct AppState {
@@ -27,6 +27,7 @@ pub struct AppState {
 struct RecordingHandle {
     session_id: String,
     root: PathBuf,
+    final_recording_path: PathBuf,
     backend: String,
     stop: Arc<AtomicBool>,
     frames_written: Arc<AtomicU32>,
@@ -71,6 +72,7 @@ pub struct CaptureConfig {
     pub fps: Option<u32>,
     pub backend: Option<String>,
     pub target_label: Option<String>,
+    pub output_root: Option<String>,
     pub cultivar: Option<String>,
     pub notes: Option<String>,
     pub max_frames: Option<u32>,
@@ -87,6 +89,7 @@ pub struct ResolvedCaptureConfig {
     pub fps: u32,
     pub backend: String,
     pub target_label: String,
+    pub output_root: Option<String>,
     pub cultivar: String,
     pub notes: String,
     pub max_frames: Option<u32>,
@@ -103,15 +106,24 @@ impl CaptureConfig {
         let backend = self.backend.unwrap_or_else(|| "auto".to_string());
         let point_stride = self.point_stride.unwrap_or(4).clamp(1, 12);
         let min_depth_m = self.min_depth_m.unwrap_or(0.12).clamp(0.02, 4.0);
-        let max_depth_m = self.max_depth_m.unwrap_or(1.4).clamp(min_depth_m + 0.01, 8.0);
-        let max_frames = self.max_frames.and_then(|value| (value > 0).then_some(value));
+        let max_depth_m = self
+            .max_depth_m
+            .unwrap_or(1.4)
+            .clamp(min_depth_m + 0.01, 8.0);
+        let max_frames = self
+            .max_frames
+            .and_then(|value| (value > 0).then_some(value));
 
         ResolvedCaptureConfig {
             width,
             height,
             fps,
             backend,
-            target_label: non_empty(self.target_label, "mini_tomato"),
+            target_label: non_empty(self.target_label, "scan"),
+            output_root: self
+                .output_root
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty()),
             cultivar: non_empty(self.cultivar, "unknown"),
             notes: self.notes.unwrap_or_default(),
             max_frames,
@@ -333,6 +345,7 @@ pub fn start_recording(
 
     let (mut backend, backend_name, notice) = create_backend(&config)?;
     let session = storage::create_session(&config, &backend_name)?;
+    let final_recording_path = storage::session_recording_path(&session);
     let stop = Arc::new(AtomicBool::new(false));
     let frames_written = Arc::new(AtomicU32::new(0));
 
@@ -361,7 +374,8 @@ pub fn start_recording(
                 Ok(frame) => {
                     consecutive_errors = 0;
                     frame_index += 1;
-                    match storage::write_frame(&thread_session, &thread_config, frame_index, &frame) {
+                    match storage::write_frame(&thread_session, &thread_config, frame_index, &frame)
+                    {
                         Ok(summary) => {
                             thread_frames_written.store(frame_index, Ordering::SeqCst);
                             let _ = app.emit(
@@ -374,7 +388,10 @@ pub fn start_recording(
                             );
                         }
                         Err(error) => {
-                            emit_error(&app, format!("failed to save frame {frame_index}: {error}"));
+                            emit_error(
+                                &app,
+                                format!("failed to save frame {frame_index}: {error}"),
+                            );
                         }
                     }
                 }
@@ -400,7 +417,13 @@ pub fn start_recording(
             "finished"
         };
         let count = thread_frames_written.load(Ordering::SeqCst);
-        let _ = storage::finish_session(&thread_session, &thread_config, &backend_for_thread, status, count);
+        let _ = storage::finish_session(
+            &thread_session,
+            &thread_config,
+            &backend_for_thread,
+            status,
+            count,
+        );
         let _ = app.emit(
             "capture-progress",
             CaptureEvent {
@@ -415,6 +438,7 @@ pub fn start_recording(
     *guard = Some(RecordingHandle {
         session_id: session.session_id.clone(),
         root: session.root.clone(),
+        final_recording_path,
         backend: backend_name.clone(),
         stop,
         frames_written,
@@ -437,6 +461,7 @@ fn start_privileged_recording(
     config: &ResolvedCaptureConfig,
 ) -> Result<RecordingHandle, String> {
     let session = storage::create_session(config, "realsense")?;
+    let final_recording_path = storage::session_recording_path(&session);
     let helper_id = format!(
         "realsense_recording_{}_{}",
         chrono::Local::now().format("%H%M%S"),
@@ -466,7 +491,7 @@ fn start_privileged_recording(
         stop_path.to_string_lossy().to_string(),
         log_path.to_string_lossy().to_string(),
     ];
-    let launch_mode = if let Some(helper) = installed_helper_if_ready() {
+    let launch_mode = if let Some(helper) = installed_helper_if_current() {
         let stderr = fs::File::create(&log_path)
             .map_err(|error| format!("failed to create recording helper log: {error}"))?;
         let child = Command::new(&helper)
@@ -520,8 +545,7 @@ fn start_privileged_recording(
                 "ready" | "frame" => break,
                 "error" => {
                     let _ = stop_helper_process(&pid_path, &launch_mode);
-                    let _ =
-                        storage::finish_session(&session, config, "realsense", "failed", 0);
+                    let _ = storage::finish_session(&session, config, "realsense", "failed", 0);
                     return Err(event
                         .message
                         .unwrap_or_else(|| "recording helper failed to start".to_string()));
@@ -551,6 +575,8 @@ fn start_privileged_recording(
     let bridge = spawn_privileged_recording_event_bridge(
         app,
         session.session_id.clone(),
+        session.root.clone(),
+        final_recording_path.clone(),
         progress_path.clone(),
         pid_path.clone(),
         Arc::clone(&stop),
@@ -560,6 +586,7 @@ fn start_privileged_recording(
     Ok(RecordingHandle {
         session_id: session.session_id,
         root: session.root,
+        final_recording_path,
         backend: "realsense".to_string(),
         stop,
         frames_written,
@@ -577,6 +604,8 @@ fn start_privileged_recording(
 fn spawn_privileged_recording_event_bridge(
     app: tauri::AppHandle,
     session_id: String,
+    session_root: PathBuf,
+    final_recording_path: PathBuf,
     progress_path: PathBuf,
     pid_path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -632,6 +661,7 @@ fn spawn_privileged_recording_event_bridge(
             }
             thread::sleep(Duration::from_millis(33));
         }
+        let _ = storage::finalize_recording_file(&session_root, &final_recording_path);
         cleanup_finished_recording(&app, &session_id);
     })
 }
@@ -710,7 +740,9 @@ pub fn start_preview(
                                 },
                             );
                         }
-                        Err(error) => emit_error(&app, format!("failed to render preview: {error}")),
+                        Err(error) => {
+                            emit_error(&app, format!("failed to render preview: {error}"))
+                        }
                     }
                 }
                 Err(error) => {
@@ -764,12 +796,15 @@ pub fn start_privileged_preview(
     config: CaptureConfig,
 ) -> Result<PrivilegedPreviewStarted, String> {
     let config = config.resolve();
-    let session_id = format!("realsense_preview_{}", chrono::Local::now().format("%H%M%S"));
+    let session_id = format!(
+        "realsense_preview_{}",
+        chrono::Local::now().format("%H%M%S")
+    );
     let frame_path = std::env::temp_dir().join(format!("{session_id}.json"));
     let pid_path = std::env::temp_dir().join(format!("{session_id}.pid"));
     let log_path = std::env::temp_dir().join(format!("{session_id}.log"));
 
-    if let Some(helper) = installed_helper_if_ready() {
+    if let Some(helper) = installed_helper_if_current() {
         let launch_log = std::env::temp_dir().join(format!("{session_id}_launch.log"));
         let stderr = fs::File::create(&launch_log)
             .map_err(|error| format!("failed to create helper launch log: {error}"))?;
@@ -817,7 +852,10 @@ pub fn start_privileged_preview(
         shell_quote(&log_path.to_string_lossy()),
         shell_quote(&pid_path.to_string_lossy()),
     );
-    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        apple_script_string(&shell)
+    );
 
     run_osascript_with_timeout(osascript, script, Duration::from_secs(20))
         .map_err(|error| format!("administrator preview helper failed: {error}"))?;
@@ -848,9 +886,16 @@ pub fn install_privileged_helper() -> Result<InstalledHelper, String> {
         shell_quote(&destination.to_string_lossy()),
         shell_quote(&destination.to_string_lossy()),
     );
-    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
-    run_osascript_with_timeout(PathBuf::from("/usr/bin/osascript"), script, Duration::from_secs(60))
-        .map_err(|error| format!("helper install failed: {error}"))?;
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        apple_script_string(&shell)
+    );
+    run_osascript_with_timeout(
+        PathBuf::from("/usr/bin/osascript"),
+        script,
+        Duration::from_secs(60),
+    )
+    .map_err(|error| format!("helper install failed: {error}"))?;
 
     let status = privileged_helper_status()?;
     if !status.ready || !status.current {
@@ -909,7 +954,11 @@ pub fn read_privileged_recording_frame(progress_path: String) -> Result<FrameSum
     event
         .summary
         .filter(|_| event.kind == "frame")
-        .ok_or_else(|| event.message.unwrap_or_else(|| "waiting for RGB-D recording frame".to_string()))
+        .ok_or_else(|| {
+            event
+                .message
+                .unwrap_or_else(|| "waiting for RGB-D recording frame".to_string())
+        })
 }
 
 #[tauri::command]
@@ -924,7 +973,10 @@ pub fn read_latest_privileged_preview_frame() -> Result<FrameSummary, String> {
         let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !name.starts_with("realsense_preview_") || !name.ends_with(".json") || name.ends_with(".tmp") {
+        if !name.starts_with("realsense_preview_")
+            || !name.ends_with(".json")
+            || name.ends_with(".tmp")
+        {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -957,8 +1009,8 @@ pub fn read_latest_privileged_preview_frame() -> Result<FrameSummary, String> {
             path.to_string_lossy()
         ));
     }
-    let bytes = fs::read(&path)
-        .map_err(|error| format!("failed to read latest preview frame: {error}"))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("failed to read latest preview frame: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| {
         format!(
             "invalid latest preview frame JSON at {}: {error}",
@@ -968,7 +1020,10 @@ pub fn read_latest_privileged_preview_frame() -> Result<FrameSummary, String> {
 }
 
 #[tauri::command]
-pub fn stop_privileged_preview(pid_path: String, launch_mode: Option<String>) -> Result<(), String> {
+pub fn stop_privileged_preview(
+    pid_path: String,
+    launch_mode: Option<String>,
+) -> Result<(), String> {
     stop_helper_process(
         &PathBuf::from(pid_path),
         launch_mode.as_deref().unwrap_or("administrator-osascript"),
@@ -994,8 +1049,14 @@ fn stop_helper_process(pid_path: &PathBuf, launch_mode: &str) -> Result<(), Stri
     }
 
     let shell = format!("kill {} 2>/dev/null || true", shell_quote(pid));
-    let script = format!("do shell script {} with administrator privileges", apple_script_string(&shell));
-    let _ = Command::new("/usr/bin/osascript").arg("-e").arg(script).output();
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        apple_script_string(&shell)
+    );
+    let _ = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
     Ok(())
 }
 
@@ -1049,6 +1110,7 @@ pub fn stop_recording(state: State<'_, AppState>) -> Result<SessionStopped, Stri
             .join()
             .map_err(|_| "recording thread did not finish cleanly".to_string())?;
     }
+    storage::finalize_recording_file(&recording.root, &recording.final_recording_path)?;
     Ok(SessionStopped {
         session_id: recording.session_id,
         root: recording.root.to_string_lossy().to_string(),
@@ -1066,7 +1128,11 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 
     let mut command = if cfg!(target_os = "macos") {
         let mut command = Command::new("open");
-        command.arg(&target);
+        if target.is_dir() {
+            command.arg("-a").arg("Finder").arg(&target);
+        } else {
+            command.arg("-R").arg(&target);
+        }
         command
     } else if cfg!(target_os = "windows") {
         let mut command = Command::new("explorer");
@@ -1183,7 +1249,9 @@ fn helper_pid_exists(pid_path: &PathBuf) -> bool {
         if libc::kill(pid as libc::pid_t, 0) == 0 {
             return true;
         }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or_default();
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default();
         errno == libc::EPERM
     }
     #[cfg(not(unix))]
@@ -1220,6 +1288,11 @@ fn installed_helper_if_ready() -> Option<PathBuf> {
     Some(path)
 }
 
+fn installed_helper_if_current() -> Option<PathBuf> {
+    let path = installed_helper_if_ready()?;
+    helper_protocol_is_compatible(&path).then_some(path)
+}
+
 fn helper_protocol_is_compatible(path: &PathBuf) -> bool {
     let Ok(output) = Command::new(path)
         .args(["--realsense-helper", "protocol"])
@@ -1227,17 +1300,15 @@ fn helper_protocol_is_compatible(path: &PathBuf) -> bool {
     else {
         return false;
     };
-    if output.status.success() {
-        return String::from_utf8_lossy(&output.stdout).trim() == REALSENSE_HELPER_PROTOCOL;
-    }
-
-    // The first installed helper predates the explicit protocol command but
-    // uses the same live/record argument contract. Accept it so frontend-only
-    // updates do not trigger another administrator password prompt.
-    String::from_utf8_lossy(&output.stderr).contains("unknown helper mode: protocol")
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim() == REALSENSE_HELPER_PROTOCOL
 }
 
-fn run_osascript_with_timeout(osascript: PathBuf, script: String, timeout: Duration) -> Result<(), String> {
+fn run_osascript_with_timeout(
+    osascript: PathBuf,
+    script: String,
+    timeout: Duration,
+) -> Result<(), String> {
     let mut child = Command::new(osascript)
         .arg("-e")
         .arg(script)
@@ -1363,7 +1434,8 @@ impl CameraBackend for SyntheticBackend {
                     if d <= 1.0 {
                         let rim = (1.0 - d).sqrt();
                         z = tomato_depth + 0.055 * d;
-                        let shine = (1.0 - ((dx + 0.35).powi(2) + (dy + 0.45).powi(2)) * 5.0).max(0.0);
+                        let shine =
+                            (1.0 - ((dx + 0.35).powi(2) + (dy + 0.45).powi(2)) * 5.0).max(0.0);
                         color = [
                             (165.0 + 70.0 * rim + 35.0 * shine).clamp(0.0, 255.0) as u8,
                             (38.0 + 34.0 * rim + 38.0 * shine).clamp(0.0, 255.0) as u8,
@@ -1406,16 +1478,32 @@ pub fn default_output_root() -> Result<PathBuf, String> {
     let root = dirs::data_local_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Tomato Twin Capture")
+        .join("AgriScan Studio")
         .join("Scans");
     fs::create_dir_all(&root).map_err(|error| format!("failed to create output root: {error}"))?;
     Ok(root)
 }
 
+#[tauri::command]
+pub fn default_save_location() -> Result<String, String> {
+    default_output_root().map(|path| path.to_string_lossy().to_string())
+}
+
+pub fn legacy_output_root() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Tomato Twin Capture")
+        .join("Scans")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{AssetBuildOptions, detect_asset_tools, generate_scan_assets};
+    use crate::assets::{
+        AssetBuildOptions, detect_asset_tools, generate_scan_assets, load_scan_data,
+    };
+    use crate::mcap_io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1435,6 +1523,7 @@ mod tests {
             fps: 30,
             backend: "synthetic".to_string(),
             target_label: "e2e_tomato".to_string(),
+            output_root: Some(output_root.to_string_lossy().to_string()),
             cultivar: "test".to_string(),
             notes: "native pipeline test".to_string(),
             max_frames: Some(4),
@@ -1450,12 +1539,17 @@ mod tests {
             let summary = storage::write_frame(&session, &config, frame_index, &frame)
                 .expect("persist synthetic RGB-D frame");
             assert!(summary.paths.rgb.is_some());
-            assert!(PathBuf::from(summary.paths.depth).is_file());
-            assert!(PathBuf::from(summary.paths.point_cloud).is_file());
-            assert!(PathBuf::from(summary.paths.metadata).is_file());
+            assert!(summary.paths.depth.contains("e2e_tomato.mcap#"));
+            assert!(summary.paths.point_cloud.contains("e2e_tomato.mcap#"));
+            assert!(summary.paths.metadata.contains("e2e_tomato.mcap#"));
         }
         storage::finish_session(&session, &config, "synthetic", "finished", 4)
             .expect("finish synthetic session");
+        let recording = mcap_io::find_recording_path(&session.root).expect("find MCAP recording");
+        assert!(recording.is_file());
+        let topics = mcap_io::validate_recording(&recording).expect("validate MCAP topics");
+        assert!(topics.iter().any(|topic| topic == mcap_io::TOPIC_COLOR));
+        assert_eq!(mcap_io::frame_count(&recording).expect("count frames"), 4);
 
         let result = generate_scan_assets(AssetBuildOptions {
             session_root: session.root.to_string_lossy().to_string(),
@@ -1478,8 +1572,18 @@ mod tests {
         assert!(PathBuf::from(&result.splat).is_file());
         assert!(PathBuf::from(result.mesh_fbx.expect("native FBX path")).is_file());
         assert!(PathBuf::from(&result.preview_json).is_file());
-        assert_eq!(result.tools.fbx_exporter, "Built-in native FBX 7.4 exporter");
+        assert_eq!(
+            result.tools.fbx_exporter,
+            "Built-in native FBX 7.4 exporter"
+        );
         assert!(result.preview.points.len() > 1_000);
+        let loaded_ply =
+            load_scan_data(result.gaussian_ply.clone()).expect("load existing 3DGS PLY");
+        assert_eq!(loaded_ply.point_count, result.point_count);
+        assert!(!loaded_ply.preview.points.is_empty());
+        let loaded_splat = load_scan_data(result.splat.clone()).expect("load existing .splat");
+        assert_eq!(loaded_splat.point_count, result.point_count);
+        assert!(!loaded_splat.preview.points.is_empty());
 
         if detect_asset_tools().mlx_available {
             let refined = generate_scan_assets(AssetBuildOptions {
@@ -1498,7 +1602,7 @@ mod tests {
                 collider_max_faces: Some(5_000),
             })
             .expect("run gsplat-mlx refinement on recorded frames");
-            assert!(refined.gaussian_ply.ends_with("tomato_gaussians_mlx.ply"));
+            assert!(refined.gaussian_ply.ends_with("scan_gaussians_mlx.ply"));
             assert!(refined.mlx_status.contains("gsplat-mlx"));
             assert!(PathBuf::from(refined.splat).is_file());
         }

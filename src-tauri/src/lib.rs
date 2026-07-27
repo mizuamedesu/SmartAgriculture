@@ -1,6 +1,7 @@
 mod assets;
 mod capture;
 mod fbx;
+mod mcap_io;
 mod realsense;
 mod storage;
 
@@ -13,15 +14,16 @@ use std::{
 
 use assets::{
     detect_asset_tools, ensure_mlx_3dgs, generate_scan_assets, load_latest_scan_assets,
+    load_scan_data,
 };
-use capture::{CameraBackend, CaptureEvent, ResolvedCaptureConfig};
 use capture::{
-    AppState, ensure_privileged_helper, install_privileged_helper, list_devices,
-    privileged_helper_status, probe_runtime, read_latest_privileged_preview_frame,
+    AppState, default_save_location, ensure_privileged_helper, install_privileged_helper,
+    list_devices, privileged_helper_status, probe_runtime, read_latest_privileged_preview_frame,
     read_privileged_preview_frame, read_privileged_recording_frame, reveal_path, start_preview,
     start_privileged_preview, start_recording, stop_preview, stop_privileged_preview,
     stop_recording,
 };
+use capture::{CameraBackend, CaptureEvent, ResolvedCaptureConfig};
 use realsense::ensure_realsense_sdk;
 
 pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
@@ -38,7 +40,10 @@ pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
 }
 
 fn run_live_realsense_helper(args: &[String]) -> Result<(), String> {
-    let frame_path = PathBuf::from(args.first().ok_or_else(|| "missing frame path".to_string())?);
+    let frame_path = PathBuf::from(
+        args.first()
+            .ok_or_else(|| "missing frame path".to_string())?,
+    );
     let width = args
         .get(1)
         .ok_or_else(|| "missing width".to_string())?
@@ -65,7 +70,8 @@ fn run_live_realsense_helper(args: &[String]) -> Result<(), String> {
         height,
         fps,
         backend: "realsense".to_string(),
-        target_label: "mini_tomato".to_string(),
+        target_label: "scan_target".to_string(),
+        output_root: None,
         cultivar: "unknown".to_string(),
         notes: String::new(),
         max_frames: None,
@@ -88,7 +94,8 @@ fn run_live_realsense_helper(args: &[String]) -> Result<(), String> {
         match camera.capture_frame() {
             Ok(frame) => {
                 frame_index += 1;
-                let summary = storage::preview_frame_summary(&session_id, &config, frame_index, &frame)?;
+                let summary =
+                    storage::preview_frame_summary(&session_id, &config, frame_index, &frame)?;
                 let json = serde_json::to_vec(&summary)
                     .map_err(|error| format!("failed to encode preview JSON: {error}"))?;
                 let tmp = frame_path.with_extension("json.tmp");
@@ -235,13 +242,7 @@ fn run_record_realsense_helper(args: &[String]) -> Result<(), String> {
         }
     }
 
-    storage::finish_session(
-        &session,
-        &config,
-        "realsense",
-        final_status,
-        frame_index,
-    )?;
+    storage::finish_session(&session, &config, "realsense", final_status, frame_index)?;
     publish_capture_event(
         &progress_path,
         &CaptureEvent {
@@ -258,8 +259,7 @@ fn publish_capture_event(path: &PathBuf, event: &CaptureEvent) -> Result<(), Str
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, json)
         .map_err(|error| format!("failed to write recording progress: {error}"))?;
-    fs::rename(&tmp, path)
-        .map_err(|error| format!("failed to publish recording progress: {error}"))
+    fs::rename(&tmp, path).map_err(|error| format!("failed to publish recording progress: {error}"))
 }
 
 fn clear_stale_realsense_helpers() {
@@ -349,6 +349,7 @@ fn helper_log(path: &PathBuf, message: &str) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             probe_runtime,
@@ -366,12 +367,14 @@ pub fn run() {
             start_recording,
             stop_recording,
             reveal_path,
+            default_save_location,
             ensure_realsense_sdk,
             detect_asset_tools,
             ensure_mlx_3dgs,
             generate_scan_assets,
-            load_latest_scan_assets
+            load_latest_scan_assets,
+            load_scan_data
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run Tomato Twin Capture");
+        .expect("failed to run AgriScan Studio");
 }

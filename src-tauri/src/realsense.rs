@@ -2,9 +2,8 @@ use std::{
     ffi::CStr,
     os::raw::{c_char, c_int, c_uint, c_void},
     path::PathBuf,
-    ptr,
     process::Command,
-    slice,
+    ptr, slice,
     sync::Arc,
     thread,
     time::Duration,
@@ -72,8 +71,7 @@ type Rs2CreateContext = unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut 
 type Rs2DeleteContext = unsafe extern "C" fn(*mut Rs2Context);
 type Rs2QueryDevices =
     unsafe extern "C" fn(*const Rs2Context, *mut *mut Rs2Error) -> *mut Rs2DeviceList;
-type Rs2GetDeviceCount =
-    unsafe extern "C" fn(*const Rs2DeviceList, *mut *mut Rs2Error) -> c_int;
+type Rs2GetDeviceCount = unsafe extern "C" fn(*const Rs2DeviceList, *mut *mut Rs2Error) -> c_int;
 type Rs2DeleteDeviceList = unsafe extern "C" fn(*mut Rs2DeviceList);
 type Rs2CreateDevice =
     unsafe extern "C" fn(*const Rs2DeviceList, c_int, *mut *mut Rs2Error) -> *mut Rs2Device;
@@ -107,8 +105,7 @@ type Rs2DeletePipelineProfile = unsafe extern "C" fn(*mut Rs2PipelineProfile);
 type Rs2PipelineWaitForFrames =
     unsafe extern "C" fn(*mut Rs2Pipeline, c_uint, *mut *mut Rs2Error) -> *mut Rs2Frame;
 type Rs2ReleaseFrame = unsafe extern "C" fn(*mut Rs2Frame);
-type Rs2EmbeddedFramesCount =
-    unsafe extern "C" fn(*mut Rs2Frame, *mut *mut Rs2Error) -> c_int;
+type Rs2EmbeddedFramesCount = unsafe extern "C" fn(*mut Rs2Frame, *mut *mut Rs2Error) -> c_int;
 type Rs2ExtractFrame =
     unsafe extern "C" fn(*mut Rs2Frame, c_int, *mut *mut Rs2Error) -> *mut Rs2Frame;
 type Rs2GetFrameStreamProfile =
@@ -124,20 +121,14 @@ type Rs2GetStreamProfileData = unsafe extern "C" fn(
 );
 type Rs2GetVideoStreamIntrinsics =
     unsafe extern "C" fn(*const Rs2StreamProfile, *mut Rs2Intrinsics, *mut *mut Rs2Error);
-type Rs2GetFrameData =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> *const c_void;
-type Rs2GetFrameDataSize =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
+type Rs2GetFrameData = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> *const c_void;
+type Rs2GetFrameDataSize = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
 type Rs2GetFrameWidth = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
 type Rs2GetFrameHeight = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
-type Rs2GetFrameStride =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
-type Rs2DepthFrameGetUnits =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> f32;
-type Rs2GetFrameNumber =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> u64;
-type Rs2GetFrameTimestamp =
-    unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> f64;
+type Rs2GetFrameStride = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> c_int;
+type Rs2DepthFrameGetUnits = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> f32;
+type Rs2GetFrameNumber = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> u64;
+type Rs2GetFrameTimestamp = unsafe extern "C" fn(*const Rs2Frame, *mut *mut Rs2Error) -> f64;
 type Rs2GetErrorMessage = unsafe extern "C" fn(*const Rs2Error) -> *const c_char;
 type Rs2GetFailedFunction = unsafe extern "C" fn(*const Rs2Error) -> *const c_char;
 type Rs2GetFailedArgs = unsafe extern "C" fn(*const Rs2Error) -> *const c_char;
@@ -226,10 +217,7 @@ impl Rs2Api {
             rs2_delete_device_list: symbol!("rs2_delete_device_list", Rs2DeleteDeviceList),
             rs2_create_device: symbol!("rs2_create_device", Rs2CreateDevice),
             rs2_delete_device: symbol!("rs2_delete_device", Rs2DeleteDevice),
-            rs2_supports_device_info: symbol!(
-                "rs2_supports_device_info",
-                Rs2SupportsDeviceInfo
-            ),
+            rs2_supports_device_info: symbol!("rs2_supports_device_info", Rs2SupportsDeviceInfo),
             rs2_get_device_info: symbol!("rs2_get_device_info", Rs2GetDeviceInfo),
             rs2_create_pipeline: symbol!("rs2_create_pipeline", Rs2CreatePipeline),
             rs2_delete_pipeline: symbol!("rs2_delete_pipeline", Rs2DeletePipeline),
@@ -250,10 +238,7 @@ impl Rs2Api {
                 Rs2PipelineWaitForFrames
             ),
             rs2_release_frame: symbol!("rs2_release_frame", Rs2ReleaseFrame),
-            rs2_embedded_frames_count: symbol!(
-                "rs2_embedded_frames_count",
-                Rs2EmbeddedFramesCount
-            ),
+            rs2_embedded_frames_count: symbol!("rs2_embedded_frames_count", Rs2EmbeddedFramesCount),
             rs2_extract_frame: symbol!("rs2_extract_frame", Rs2ExtractFrame),
             rs2_get_frame_stream_profile: symbol!(
                 "rs2_get_frame_stream_profile",
@@ -275,10 +260,7 @@ impl Rs2Api {
                 "rs2_get_frame_stride_in_bytes",
                 Rs2GetFrameStride
             ),
-            rs2_depth_frame_get_units: symbol!(
-                "rs2_depth_frame_get_units",
-                Rs2DepthFrameGetUnits
-            ),
+            rs2_depth_frame_get_units: symbol!("rs2_depth_frame_get_units", Rs2DepthFrameGetUnits),
             rs2_get_frame_number: symbol!("rs2_get_frame_number", Rs2GetFrameNumber),
             rs2_get_frame_timestamp: symbol!("rs2_get_frame_timestamp", Rs2GetFrameTimestamp),
             rs2_get_error_message: symbol!("rs2_get_error_message", Rs2GetErrorMessage),
@@ -336,7 +318,8 @@ pub fn probe_runtime() -> RuntimeProbe {
             let api_version = api.api_version_string().ok();
             match list_devices_with_api(&api) {
                 Ok(devices) => {
-                    let (status, action_required) = if devices.is_empty() && !usb_devices.is_empty() {
+                    let (status, action_required) = if devices.is_empty() && !usb_devices.is_empty()
+                    {
                         usb_diagnostic_status(&usb_devices)
                     } else if devices.is_empty() {
                         (
@@ -374,7 +357,9 @@ pub fn probe_runtime() -> RuntimeProbe {
                             "RealSense is visible on USB, but librealsense cannot open it: {error}"
                         )
                     },
-                    install_hint: Some("Check USB3 cable/port, then unplug and reconnect the camera.".to_string()),
+                    install_hint: Some(
+                        "Check USB3 cable/port, then unplug and reconnect the camera.".to_string(),
+                    ),
                     action_required: usb_diagnostic_status(&usb_devices).1,
                 },
             }
@@ -430,13 +415,16 @@ pub fn ensure_realsense_sdk() -> Result<SdkSetupResult, String> {
     let mut install_ran = false;
 
     if !sdk_loaded_before {
-        let brew = brew_path
-            .as_ref()
-            .ok_or_else(|| "Homebrew was not found. Install Homebrew once, then rerun SDK setup.".to_string())?;
+        let brew = brew_path.as_ref().ok_or_else(|| {
+            "Homebrew was not found. Install Homebrew once, then rerun SDK setup.".to_string()
+        })?;
 
         match run_command(brew, &["list", "--versions", "librealsense"]) {
             Ok(output) if output.status_success => {
-                log.push(format!("librealsense is already installed: {}", output.summary()));
+                log.push(format!(
+                    "librealsense is already installed: {}",
+                    output.summary()
+                ));
             }
             Ok(_) | Err(_) => {
                 install_ran = true;
@@ -484,8 +472,14 @@ pub fn ensure_realsense_sdk() -> Result<SdkSetupResult, String> {
                     .unwrap_or_default()
             ));
         }
-        if usb_devices.iter().any(|device| device.link_speed_mbps.unwrap_or(0) < 5_000) {
-            log.push("RealSense is connected below USB3 speed; RGB-D streaming is unlikely to work.".to_string());
+        if usb_devices
+            .iter()
+            .any(|device| device.link_speed_mbps.unwrap_or(0) < 5_000)
+        {
+            log.push(
+                "RealSense is connected below USB3 speed; RGB-D streaming is unlikely to work."
+                    .to_string(),
+            );
         }
     }
 
@@ -500,7 +494,9 @@ pub fn ensure_realsense_sdk() -> Result<SdkSetupResult, String> {
         }
 
         if let Some(owner) = detect_uvc_assistant_owner() {
-            log.push(format!("macOS UVCAssistant owns RealSense interfaces: {owner}"));
+            log.push(format!(
+                "macOS UVCAssistant owns RealSense interfaces: {owner}"
+            ));
             if let Some(osascript) = find_executable("osascript") {
                 let script = "do shell script \"launchctl disable system/com.apple.cmio.registerassistantservice; launchctl disable system/com.apple.cmio.uvcassistantextension; launchctl disable system/com.apple.cmio.VDCAssistant; launchctl disable system/com.apple.cameracaptured; launchctl disable system/com.apple.appleh16camerad; killall -9 com.apple.cmio.registerassistantservice UVCAssistant VDCAssistant cameracaptured appleh16camerad AppleCameraAssistant 2>/dev/null || true\" with administrator privileges";
                 match run_command(&osascript, &["-e", script]) {
@@ -591,7 +587,8 @@ impl RealSenseCamera {
             return Err("rs2_create_context returned null".to_string());
         }
 
-        let pipeline = match api.call(|error| unsafe { (api.rs2_create_pipeline)(context, error) }) {
+        let pipeline = match api.call(|error| unsafe { (api.rs2_create_pipeline)(context, error) })
+        {
             Ok(pipeline) if !pipeline.is_null() => pipeline,
             Ok(_) => {
                 unsafe { (api.rs2_delete_context)(context) };
@@ -707,9 +704,9 @@ impl RealSenseCamera {
     }
 
     fn read_frameset(&self, frameset: *mut Rs2Frame) -> Result<SensorFrame, String> {
-        let count = self.api.call(|error| unsafe {
-            (self.api.rs2_embedded_frames_count)(frameset, error)
-        })?;
+        let count = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_embedded_frames_count)(frameset, error) })?;
 
         let mut depth: Option<(DepthFrame, Intrinsics, f64, u64)> = None;
         let mut color: Option<ColorFrame> = None;
@@ -748,9 +745,9 @@ impl RealSenseCamera {
     }
 
     fn read_stream_frame(&self, frame: *mut Rs2Frame) -> Result<StreamPacket, String> {
-        let profile = self.api.call(|error| unsafe {
-            (self.api.rs2_get_frame_stream_profile)(frame, error)
-        })?;
+        let profile = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_get_frame_stream_profile)(frame, error) })?;
         if profile.is_null() {
             return Ok(StreamPacket::Other);
         }
@@ -774,7 +771,9 @@ impl RealSenseCamera {
 
         if stream == RS2_STREAM_DEPTH && format == RS2_FORMAT_Z16 {
             self.read_depth_frame(frame, profile)
-        } else if stream == RS2_STREAM_COLOR && (format == RS2_FORMAT_RGB8 || format == RS2_FORMAT_BGR8) {
+        } else if stream == RS2_STREAM_COLOR
+            && (format == RS2_FORMAT_RGB8 || format == RS2_FORMAT_BGR8)
+        {
             self.read_color_frame(frame, format)
         } else {
             Ok(StreamPacket::Other)
@@ -792,9 +791,9 @@ impl RealSenseCamera {
             .frame_int(frame, self.api.rs2_get_frame_stride_in_bytes)?
             .max((width * 2) as c_int) as usize;
         let data_size = self.frame_int(frame, self.api.rs2_get_frame_data_size)? as usize;
-        let data_ptr = self.api.call(|error| unsafe {
-            (self.api.rs2_get_frame_data)(frame, error)
-        })?;
+        let data_ptr = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_get_frame_data)(frame, error) })?;
         if data_ptr.is_null() {
             return Err("depth frame data pointer is null".to_string());
         }
@@ -811,15 +810,15 @@ impl RealSenseCamera {
             }
         }
 
-        let units_m = self.api.call(|error| unsafe {
-            (self.api.rs2_depth_frame_get_units)(frame, error)
-        })?;
-        let frame_number = self.api.call(|error| unsafe {
-            (self.api.rs2_get_frame_number)(frame, error)
-        })?;
-        let timestamp_ms = self.api.call(|error| unsafe {
-            (self.api.rs2_get_frame_timestamp)(frame, error)
-        })?;
+        let units_m = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_depth_frame_get_units)(frame, error) })?;
+        let frame_number = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_get_frame_number)(frame, error) })?;
+        let timestamp_ms = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_get_frame_timestamp)(frame, error) })?;
 
         let mut raw_intrinsics = Rs2Intrinsics::default();
         self.api.call(|error| unsafe {
@@ -847,16 +846,20 @@ impl RealSenseCamera {
         ))
     }
 
-    fn read_color_frame(&self, frame: *mut Rs2Frame, format: c_int) -> Result<StreamPacket, String> {
+    fn read_color_frame(
+        &self,
+        frame: *mut Rs2Frame,
+        format: c_int,
+    ) -> Result<StreamPacket, String> {
         let width = self.frame_int(frame, self.api.rs2_get_frame_width)? as u32;
         let height = self.frame_int(frame, self.api.rs2_get_frame_height)? as u32;
         let stride = self
             .frame_int(frame, self.api.rs2_get_frame_stride_in_bytes)?
             .max((width * 3) as c_int) as usize;
         let data_size = self.frame_int(frame, self.api.rs2_get_frame_data_size)? as usize;
-        let data_ptr = self.api.call(|error| unsafe {
-            (self.api.rs2_get_frame_data)(frame, error)
-        })?;
+        let data_ptr = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_get_frame_data)(frame, error) })?;
         if data_ptr.is_null() {
             return Err("color frame data pointer is null".to_string());
         }
@@ -958,7 +961,8 @@ fn list_devices_with_api(api: &Rs2Api) -> Result<Vec<CameraDevice>, String> {
 
         let mut output = Vec::new();
         for index in 0..count {
-            let device = api.call(|error| unsafe { (api.rs2_create_device)(devices, index, error) })?;
+            let device =
+                api.call(|error| unsafe { (api.rs2_create_device)(devices, index, error) })?;
             if device.is_null() {
                 continue;
             }
@@ -1027,9 +1031,15 @@ fn library_candidates() -> Vec<String> {
             "librealsense2.2.dylib".to_string(),
         ]
     } else if cfg!(target_os = "windows") {
-        vec!["realsense2.dll".to_string(), "librealsense2.dll".to_string()]
+        vec![
+            "realsense2.dll".to_string(),
+            "librealsense2.dll".to_string(),
+        ]
     } else {
-        vec!["librealsense2.so".to_string(), "librealsense2.so.2".to_string()]
+        vec![
+            "librealsense2.so".to_string(),
+            "librealsense2.so.2".to_string(),
+        ]
     }
 }
 
@@ -1127,7 +1137,9 @@ fn detect_usb_realsense_devices() -> Vec<UsbRealSenseDevice> {
                 if let Some(value) = parse_ioreg_u64(line) {
                     device.link_speed_mbps = Some((value / 1_000_000) as u32);
                 }
-            } else if line.contains("\"USB Product Name\"") || line.contains("\"kUSBProductString\"") {
+            } else if line.contains("\"USB Product Name\"")
+                || line.contains("\"kUSBProductString\"")
+            {
                 if let Some(value) = parse_ioreg_string(line) {
                     device.product_name = value;
                 }
@@ -1204,11 +1216,7 @@ fn usb_diagnostic_status(devices: &[UsbRealSenseDevice]) -> (String, Option<Stri
 
 fn detect_uvc_assistant_owner() -> Option<String> {
     let ioreg = PathBuf::from("/usr/sbin/ioreg");
-    let output = run_command(
-        &ioreg,
-        &["-r", "-c", "IOUSBHostInterface", "-l", "-w", "0"],
-    )
-    .ok()?;
+    let output = run_command(&ioreg, &["-r", "-c", "IOUSBHostInterface", "-l", "-w", "0"]).ok()?;
     if !output.status_success {
         return None;
     }

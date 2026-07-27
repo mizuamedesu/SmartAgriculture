@@ -466,7 +466,7 @@ def write_ply(path: Path, means: np.ndarray, scales: np.ndarray, quats: np.ndarr
     with path.open("w", encoding="utf-8") as handle:
         handle.write("ply\n")
         handle.write("format ascii 1.0\n")
-        handle.write("comment Tomato Twin Capture trained with gsplat-mlx differentiable rasterization\n")
+        handle.write("comment AgriScan Studio trained with gsplat-mlx differentiable rasterization\n")
         handle.write(f"element vertex {len(means)}\n")
         for prop in (
             "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
@@ -505,7 +505,7 @@ def main() -> None:
     write_ply(args.output_ply, means, scales, quats, opacities, colors)
 
     summary = {
-        "schemaVersion": "tomato-gsplat-mlx-train-v1",
+        "schemaVersion": "agriscan-gsplat-mlx-train-v1",
         "backend": "gsplat-mlx",
         "gsplatMlxVersion": GSPLAT_MLX_VERSION,
         "device": str(mx.default_device()),

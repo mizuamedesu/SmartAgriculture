@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Tomato Twin Capture",
+  "productName": "AgriScan Studio",
   "version": "0.1.0",
-  "identifier": "com.smartagriculture.tomato-twin-capture",
+  "identifier": "com.smartagriculture.agriscan-studio",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Tomato Twin Capture",
+        "title": "AgriScan Studio",
         "width": 1280,
         "height": 820,
         "minWidth": 980,

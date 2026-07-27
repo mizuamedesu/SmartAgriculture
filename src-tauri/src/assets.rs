@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::BTreeSet,
     ffi::OsString,
     fs::{self, File},
     io::{BufReader, BufWriter, Cursor, Read, Write},
@@ -8,12 +9,13 @@ use std::{
     time::SystemTime,
 };
 
-use png::{BitDepth, ColorType, Decoder};
+use png::{BitDepth, ColorType, Decoder, Encoder as PngEncoder};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capture::{Intrinsics, default_output_root},
+    capture::{ColorFrame, Intrinsics, default_output_root, legacy_output_root},
     fbx::{FbxMesh, FbxVertex, write_fbx},
+    mcap_io::{self, DecodedRgbdFrame},
 };
 
 const SH_C0: f32 = 0.282_094_8;
@@ -254,30 +256,145 @@ pub fn detect_asset_tools() -> AssetTools {
 
 #[tauri::command]
 pub fn load_latest_scan_assets() -> Result<Option<AssetBuildResult>, String> {
-    let scans_root = default_output_root()?;
     let mut latest: Option<(SystemTime, PathBuf)> = None;
-    let entries = fs::read_dir(&scans_root)
-        .map_err(|error| format!("failed to scan previous captures: {error}"))?;
-
-    for entry in entries.flatten() {
-        let manifest_path = entry.path().join("assets").join("asset_manifest.json");
-        if !manifest_path.is_file() {
+    for scans_root in [default_output_root()?, legacy_output_root()] {
+        if !scans_root.is_dir() {
             continue;
         }
-        let modified = fs::metadata(&manifest_path)
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if latest
-            .as_ref()
-            .is_none_or(|(latest_modified, _)| modified > *latest_modified)
-        {
-            latest = Some((modified, manifest_path));
+        let entries = fs::read_dir(&scans_root)
+            .map_err(|error| format!("failed to scan previous captures: {error}"))?;
+
+        for entry in entries.flatten() {
+            let manifest_path = entry.path().join("assets").join("asset_manifest.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let modified = fs::metadata(&manifest_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if latest
+                .as_ref()
+                .is_none_or(|(latest_modified, _)| modified > *latest_modified)
+            {
+                latest = Some((modified, manifest_path));
+            }
         }
     }
 
     let Some((_, manifest_path)) = latest else {
         return Ok(None);
     };
+    load_asset_manifest(&manifest_path).map(Some)
+}
+
+#[tauri::command]
+pub fn load_scan_data(path: String) -> Result<AssetBuildResult, String> {
+    let source = PathBuf::from(path);
+    if !source.exists() {
+        return Err("selected scan data does not exist".to_string());
+    }
+    if source.is_dir() {
+        for manifest_path in [
+            source.join("asset_manifest.json"),
+            source.join("assets").join("asset_manifest.json"),
+        ] {
+            if manifest_path.is_file() {
+                return load_asset_manifest(&manifest_path);
+            }
+        }
+        if let Some(recording) = mcap_io::find_recording_path(&source) {
+            return load_mcap_preview(&recording);
+        }
+        return Err("selected folder has no MCAP recording or asset manifest".to_string());
+    }
+
+    match source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mcap") | Some("mcp") => load_mcap_preview(&source),
+        Some("ply") => load_point_preview(&source, read_gaussian_ply(&source)?, false),
+        Some("splat") => load_point_preview(&source, read_splat(&source)?, true),
+        Some("json")
+            if source.file_name().and_then(|name| name.to_str()) == Some("asset_manifest.json") =>
+        {
+            load_asset_manifest(&source)
+        }
+        _ => Err("select an .mcap, .mcp, .ply, .splat, or asset_manifest.json file".to_string()),
+    }
+}
+
+fn load_mcap_preview(recording: &Path) -> Result<AssetBuildResult, String> {
+    let session_root = recording
+        .parent()
+        .ok_or_else(|| "MCAP recording has no parent folder".to_string())?;
+    generate_scan_assets(AssetBuildOptions {
+        session_root: path_string(session_root),
+        max_points: Some(350_000),
+        frame_stride: Some(1),
+        depth_decimation: Some(2),
+        gaussian_radius_m: Some(0.0035),
+        turntable_degrees: Some(360.0),
+        export_fbx: Some(false),
+        use_mlx: Some(false),
+        mlx_iterations: Some(0),
+        mlx_voxel_size_m: Some(0.0025),
+        mlx_train_size: Some(320),
+        mlx_max_train_views: Some(12),
+        collider_max_faces: Some(35_000),
+    })
+}
+
+fn load_point_preview(
+    source: &Path,
+    points: Vec<SplatPoint>,
+    source_is_splat: bool,
+) -> Result<AssetBuildResult, String> {
+    if points.is_empty() {
+        return Err("selected 3DGS file contains no points".to_string());
+    }
+    let root = source
+        .parent()
+        .ok_or_else(|| "selected 3DGS file has no parent folder".to_string())?;
+    let source_string = path_string(source);
+    let preview = build_preview_payload(&points);
+    Ok(AssetBuildResult {
+        root: path_string(root),
+        seed_gaussian_ply: if source_is_splat {
+            "-".to_string()
+        } else {
+            source_string.clone()
+        },
+        gaussian_ply: if source_is_splat {
+            "-".to_string()
+        } else {
+            source_string.clone()
+        },
+        splat: if source_is_splat {
+            source_string
+        } else {
+            "-".to_string()
+        },
+        mesh_obj: "-".to_string(),
+        mesh_fbx: None,
+        collider_obj: "-".to_string(),
+        collision_json: "-".to_string(),
+        collision_fbx: None,
+        preview_json: "-".to_string(),
+        manifest: "-".to_string(),
+        point_count: points.len(),
+        face_count: 0,
+        fbx_status: "No FBX loaded".to_string(),
+        mlx_status: "Loaded existing 3DGS data".to_string(),
+        collision_status: "No collider loaded".to_string(),
+        tools: detect_asset_tools(),
+        preview,
+    })
+}
+
+fn load_asset_manifest(manifest_path: &Path) -> Result<AssetBuildResult, String> {
     let manifest_data = fs::read_to_string(&manifest_path)
         .map_err(|error| format!("failed to read previous asset manifest: {error}"))?;
     let manifest: StoredAssetManifest = serde_json::from_str(&manifest_data)
@@ -290,7 +407,7 @@ pub fn load_latest_scan_assets() -> Result<Option<AssetBuildResult>, String> {
         .parent()
         .ok_or_else(|| "previous asset manifest has no parent directory".to_string())?;
 
-    Ok(Some(AssetBuildResult {
+    Ok(AssetBuildResult {
         root: path_string(asset_root),
         seed_gaussian_ply: manifest.seed_gaussian_ply,
         gaussian_ply: manifest.gaussian_ply,
@@ -309,7 +426,7 @@ pub fn load_latest_scan_assets() -> Result<Option<AssetBuildResult>, String> {
         collision_status: manifest.collision_status,
         tools: detect_asset_tools(),
         preview,
-    }))
+    })
 }
 
 #[tauri::command]
@@ -405,23 +522,36 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
         .unwrap_or(35_000)
         .clamp(500, 120_000);
 
-    let frames = load_frame_metadata(&session_root)?;
-    if frames.is_empty() {
-        return Err("no frame metadata found; capture a session first".to_string());
-    }
-
-    let selected: Vec<_> = frames
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, frame)| {
-            (index as u32)
-                .is_multiple_of(frame_stride)
-                .then_some(frame)
-        })
-        .collect();
-    if selected.is_empty() {
-        return Err("no frames selected for asset generation".to_string());
-    }
+    let recording_path = mcap_io::find_recording_path(&session_root);
+    let is_mcap = recording_path.is_some();
+    let selected = if is_mcap {
+        Vec::new()
+    } else {
+        let frames = load_frame_metadata(&session_root)?;
+        let selected: Vec<_> = frames
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, frame)| {
+                (index as u32).is_multiple_of(frame_stride).then_some(frame)
+            })
+            .collect();
+        if selected.is_empty() {
+            return Err("no frames selected for asset generation".to_string());
+        }
+        selected
+    };
+    let source_session = if is_mcap {
+        session_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        selected
+            .first()
+            .map(|frame| frame.session_id.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
 
     let asset_root = session_root.join("assets");
     let gaussian_dir = asset_root.join("gaussian_splats");
@@ -438,25 +568,42 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
         fs::create_dir_all(dir).map_err(|error| format!("failed to create {dir:?}: {error}"))?;
     }
 
-    let mesh = build_mesh(
-        &selected,
-        depth_decimation,
-        max_points,
-        gaussian_radius_m,
-        turntable_degrees,
-    )?;
+    let (mesh, mcap_training_frames) = if is_mcap {
+        build_mesh_from_mcap(
+            recording_path
+                .as_deref()
+                .ok_or_else(|| "MCAP recording path is missing".to_string())?,
+            frame_stride,
+            depth_decimation,
+            max_points,
+            gaussian_radius_m,
+            turntable_degrees,
+            mlx_max_train_views,
+        )?
+    } else {
+        (
+            build_mesh(
+                &selected,
+                depth_decimation,
+                max_points,
+                gaussian_radius_m,
+                turntable_degrees,
+            )?,
+            Vec::new(),
+        )
+    };
     if mesh.vertices.is_empty() {
         return Err("no valid depth points available for 3D reconstruction".to_string());
     }
 
-    let seed_gaussian_ply = gaussian_dir.join("tomato_gaussians_seed.ply");
-    let seed_splat = gaussian_dir.join("tomato_gaussians_seed.splat");
-    let mlx_gaussian_ply = gaussian_dir.join("tomato_gaussians_mlx.ply");
-    let mlx_splat = gaussian_dir.join("tomato_gaussians_mlx.splat");
-    let mesh_obj = mesh_dir.join("tomato_surface.obj");
-    let mesh_fbx = mesh_dir.join("tomato_surface.fbx");
-    let collider_obj = mesh_dir.join("tomato_collider.obj");
-    let collision_json = mesh_dir.join("tomato_collision.json");
+    let seed_gaussian_ply = gaussian_dir.join("scan_gaussians_seed.ply");
+    let seed_splat = gaussian_dir.join("scan_gaussians_seed.splat");
+    let mlx_gaussian_ply = gaussian_dir.join("scan_gaussians_mlx.ply");
+    let mlx_splat = gaussian_dir.join("scan_gaussians_mlx.splat");
+    let mesh_obj = mesh_dir.join("scan_surface.obj");
+    let mesh_fbx = mesh_dir.join("scan_surface.fbx");
+    let collider_obj = mesh_dir.join("scan_collider.obj");
+    let collision_json = mesh_dir.join("scan_collision.json");
     let preview_json = preview_dir.join("preview_points.json");
     let manifest = asset_root.join("asset_manifest.json");
 
@@ -479,8 +626,15 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     let mut mlx_status = "RGB-D Gaussian seed (MLX refinement disabled)".to_string();
 
     if use_mlx {
-        let refinement = run_mlx_refinement(
-            &session_root,
+        let (mlx_session_root, mlx_frame_stride, cleanup_cache) = if is_mcap {
+            let cache = mlx_dir.join("mcap_training_cache");
+            write_mcap_training_cache(&cache, &mcap_training_frames)?;
+            (cache.clone(), 1, Some(cache))
+        } else {
+            (session_root.clone(), frame_stride, None)
+        };
+        let refinement_result = run_mlx_refinement(
+            &mlx_session_root,
             &seed_gaussian_ply,
             &mlx_gaussian_ply,
             &mlx_dir,
@@ -488,12 +642,15 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
             gaussian_radius_m,
             mlx_voxel_size_m,
             mlx_iterations,
-            frame_stride,
+            mlx_frame_stride,
             turntable_degrees,
             mlx_train_size,
             mlx_max_train_views,
-        )
-        .map_err(|error| {
+        );
+        if let Some(cache) = cleanup_cache {
+            let _ = fs::remove_dir_all(cache);
+        }
+        let refinement = refinement_result.map_err(|error| {
             format!(
                 "MLX 3DGS refinement was requested but failed; no fallback was reported as success: {error}"
             )
@@ -509,11 +666,7 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     write_preview_json(&preview_json, &preview)?;
 
     let fbx_status = if export_fbx {
-        export_fbx_native(
-            &mesh_fbx,
-            &mesh,
-            &collider_mesh,
-        )?
+        export_fbx_native(&mesh_fbx, &mesh, &collider_mesh)?
     } else {
         "FBX export disabled".to_string()
     };
@@ -532,11 +685,8 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     let collision_json_string = path_string(&collision_json);
     let preview_json_string = path_string(&preview_json);
     let manifest_data = AssetManifest {
-        schema_version: "tomato-rgbd-assets-v1",
-        source_session: selected
-            .first()
-            .map(|frame| frame.session_id.as_str())
-            .unwrap_or("unknown"),
+        schema_version: "agriscan-rgbd-assets-v1",
+        source_session: &source_session,
         point_count: final_points.len(),
         face_count: mesh.faces.len(),
         seed_gaussian_ply: &seed_gaussian_ply_string,
@@ -653,8 +803,11 @@ fn build_mesh(
         };
 
         add_frame_mesh(
-            frame,
-            &depth,
+            frame.intrinsics,
+            frame.depth_units_m,
+            depth.width,
+            depth.height,
+            &depth.z16,
             color.as_ref(),
             angle,
             depth_decimation as usize,
@@ -668,11 +821,88 @@ fn build_mesh(
     Ok(MeshBuild { vertices, faces })
 }
 
+fn build_mesh_from_mcap(
+    recording_path: &Path,
+    frame_stride: u32,
+    depth_decimation: u32,
+    max_points: usize,
+    gaussian_radius_m: f32,
+    turntable_degrees: f32,
+    max_train_views: u32,
+) -> Result<(MeshBuild, Vec<DecodedRgbdFrame>), String> {
+    let total_frames = mcap_io::frame_count(recording_path)?;
+    if total_frames == 0 {
+        return Err("MCAP contains no RGB-D frames".to_string());
+    }
+    let stride = frame_stride.max(1) as usize;
+    let selected_count = total_frames.div_ceil(stride);
+    let mesh_indices = sampled_frame_indices(total_frames, stride, selected_count.min(64));
+    let training_indices = sampled_frame_indices(
+        total_frames,
+        stride,
+        selected_count.min(max_train_views.max(1) as usize),
+    );
+    let requested_indices: BTreeSet<_> = mesh_indices.union(&training_indices).copied().collect();
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    let mut training_frames = Vec::new();
+
+    mcap_io::visit_frame_indices(recording_path, &requested_indices, |frame| {
+        let selected_ordinal = frame.info.frame_index.saturating_sub(1) as usize / stride;
+        let angle = if turntable_degrees.abs() < f32::EPSILON || selected_count <= 1 {
+            0.0
+        } else {
+            let t = selected_ordinal as f32 / (selected_count - 1) as f32;
+            t * turntable_degrees.to_radians()
+        };
+        if mesh_indices.contains(&frame.info.frame_index) && vertices.len() < max_points {
+            add_frame_mesh(
+                frame.info.intrinsics,
+                frame.info.depth_units_m,
+                frame.depth.width,
+                frame.depth.height,
+                &frame.depth.z16,
+                frame.color.as_ref(),
+                angle,
+                depth_decimation as usize,
+                max_points,
+                gaussian_radius_m,
+                &mut vertices,
+                &mut faces,
+            );
+        }
+        if training_indices.contains(&frame.info.frame_index) {
+            training_frames.push(frame);
+        }
+        Ok(true)
+    })?;
+
+    Ok((MeshBuild { vertices, faces }, training_frames))
+}
+
+fn sampled_frame_indices(total_frames: usize, stride: usize, sample_count: usize) -> BTreeSet<u32> {
+    let selected_count = total_frames.div_ceil(stride);
+    let samples = sample_count.max(1).min(selected_count);
+    (0..samples)
+        .map(|sample| {
+            let ordinal = if samples <= 1 {
+                0
+            } else {
+                sample * (selected_count - 1) / (samples - 1)
+            };
+            (ordinal * stride + 1).min(total_frames) as u32
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_frame_mesh(
-    frame: &FrameMetadata,
-    depth: &DepthImage,
-    color: Option<&RgbImage>,
+    intr: Intrinsics,
+    depth_units_m: f32,
+    depth_width: u32,
+    depth_height: u32,
+    depth_z16: &[u16],
+    color: Option<&ColorFrame>,
     angle: f32,
     step: usize,
     max_points: usize,
@@ -680,15 +910,14 @@ fn add_frame_mesh(
     vertices: &mut Vec<SplatPoint>,
     faces: &mut Vec<[u32; 3]>,
 ) {
-    let width = depth.width as usize;
-    let height = depth.height as usize;
+    let width = depth_width as usize;
+    let height = depth_height as usize;
     let grid_w = width.div_ceil(step);
     let grid_h = height.div_ceil(step);
     let mut index_grid = vec![None::<u32>; grid_w * grid_h];
     let cos_a = angle.cos();
     let sin_a = angle.sin();
     let depth_jump = gaussian_radius_m.max(0.006) * 10.0;
-    let intr = frame.intrinsics;
 
     for gy in 0..grid_h {
         for gx in 0..grid_w {
@@ -697,12 +926,12 @@ fn add_frame_mesh(
             }
             let x = (gx * step).min(width - 1);
             let y = (gy * step).min(height - 1);
-            let raw = depth.z16[y * width + x];
+            let raw = depth_z16[y * width + x];
             if raw == 0 {
                 continue;
             }
 
-            let z = raw as f32 * frame.depth_units_m;
+            let z = raw as f32 * depth_units_m;
             if !(0.02..=8.0).contains(&z) {
                 continue;
             }
@@ -770,7 +999,7 @@ fn write_gaussian_ply(path: &Path, points: &[SplatPoint]) -> Result<(), String> 
     writeln!(writer, "format ascii 1.0").map_err(io_error)?;
     writeln!(
         writer,
-        "comment Tomato Twin Capture 3DGS seed generated from RealSense RGB-D"
+        "comment AgriScan Studio 3DGS seed generated from RealSense RGB-D"
     )
     .map_err(io_error)?;
     writeln!(writer, "element vertex {}", points.len()).map_err(io_error)?;
@@ -867,7 +1096,7 @@ fn encode_quat_byte(value: f32) -> u8 {
 fn write_obj(path: &Path, mesh: &MeshBuild) -> Result<(), String> {
     let file = File::create(path).map_err(|error| format!("failed to create OBJ: {error}"))?;
     let mut writer = BufWriter::new(file);
-    writeln!(writer, "# Tomato Twin Capture surface mesh").map_err(io_error)?;
+    writeln!(writer, "# AgriScan Studio surface mesh").map_err(io_error)?;
     writeln!(writer, "# Extended vertex colors: v x y z r g b").map_err(io_error)?;
     for vertex in &mesh.vertices {
         writeln!(
@@ -949,7 +1178,7 @@ fn write_collision_manifest(
     let collider_bounds = bounds(&collider_mesh.vertices);
     let sphere = bounding_sphere(&collider_mesh.vertices, collider_bounds.center);
     let manifest = CollisionManifest {
-        schema_version: "tomato-rgbd-collision-v1",
+        schema_version: "agriscan-rgbd-collision-v1",
         collider_type: "triangle_mesh",
         collider_obj: path_string(collider_obj),
         source_mesh: path_string(source_mesh),
@@ -958,7 +1187,7 @@ fn write_collision_manifest(
         bounds: collider_bounds,
         bounding_sphere: sphere,
         notes: format!(
-            "Low-poly triangle mesh collider capped at {max_faces} faces; FBX object name uses UCX_tomato_surface_00 for engine import."
+            "Low-poly triangle mesh collider capped at {max_faces} faces; FBX object name uses UCX_scan_surface_00 for engine import."
         ),
     };
     write_json(path, &manifest)?;
@@ -1034,6 +1263,86 @@ fn bounds(points: &[SplatPoint]) -> Bounds {
             (min[2] + max[2]) * 0.5,
         ],
     }
+}
+
+fn write_mcap_training_cache(cache_root: &Path, frames: &[DecodedRgbdFrame]) -> Result<(), String> {
+    if frames.is_empty() {
+        return Err("MCAP contains no RGB-D frames for MLX training".to_string());
+    }
+    if cache_root.is_dir() {
+        fs::remove_dir_all(cache_root)
+            .map_err(|error| format!("failed to clear MLX training cache: {error}"))?;
+    }
+    let rgb_dir = cache_root.join("rgb");
+    let depth_dir = cache_root.join("depth_z16");
+    let metadata_dir = cache_root.join("metadata");
+    for directory in [&rgb_dir, &depth_dir, &metadata_dir] {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("failed to create MLX training cache: {error}"))?;
+    }
+
+    for (index, frame) in frames.iter().enumerate() {
+        let stem = format!("frame_{:06}", index + 1);
+        let depth_path = depth_dir.join(format!("{stem}_depth_z16.png"));
+        write_depth_png(
+            &depth_path,
+            frame.depth.width,
+            frame.depth.height,
+            &frame.depth.z16,
+        )?;
+        let rgb_path = if let Some(color) = &frame.color {
+            let path = rgb_dir.join(format!("{stem}_rgb.png"));
+            write_rgb_png(&path, color)?;
+            Some(path)
+        } else {
+            None
+        };
+        let metadata_path = metadata_dir.join(format!("{stem}.json"));
+        let metadata = serde_json::json!({
+            "schemaVersion": "agriscan-rgbd-frame-v1",
+            "sessionId": frame.info.session_id,
+            "frameIndex": index + 1,
+            "frameNumber": frame.info.frame_number,
+            "timestampMs": frame.info.timestamp_ms,
+            "intrinsics": frame.info.intrinsics,
+            "depthUnitsM": frame.info.depth_units_m,
+            "files": {
+                "rgb": rgb_path.as_ref().map(|path| path_string(path)),
+                "depth": path_string(&depth_path)
+            }
+        });
+        write_json(&metadata_path, &metadata)?;
+    }
+    Ok(())
+}
+
+fn write_rgb_png(path: &Path, color: &ColorFrame) -> Result<(), String> {
+    let file =
+        File::create(path).map_err(|error| format!("failed to create cached RGB PNG: {error}"))?;
+    let mut encoder = PngEncoder::new(BufWriter::new(file), color.width, color.height);
+    encoder.set_color(ColorType::Rgb);
+    encoder.set_depth(BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("failed to initialize cached RGB PNG: {error}"))?;
+    writer
+        .write_image_data(&color.rgb)
+        .map_err(|error| format!("failed to write cached RGB PNG: {error}"))
+}
+
+fn write_depth_png(path: &Path, width: u32, height: u32, z16: &[u16]) -> Result<(), String> {
+    let file = File::create(path)
+        .map_err(|error| format!("failed to create cached depth PNG: {error}"))?;
+    let mut encoder = PngEncoder::new(BufWriter::new(file), width, height);
+    encoder.set_color(ColorType::Grayscale);
+    encoder.set_depth(BitDepth::Sixteen);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("failed to initialize cached depth PNG: {error}"))?;
+    let bytes: Vec<_> = z16.iter().flat_map(|value| value.to_be_bytes()).collect();
+    writer
+        .write_image_data(&bytes)
+        .map_err(|error| format!("failed to write cached depth PNG: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1258,6 +1567,45 @@ fn read_gaussian_ply(path: &Path) -> Result<Vec<SplatPoint>, String> {
     Ok(points)
 }
 
+fn read_splat(path: &Path) -> Result<Vec<SplatPoint>, String> {
+    let data =
+        fs::read(path).map_err(|error| format!("failed to read .splat file {path:?}: {error}"))?;
+    if data.len() % 32 != 0 {
+        return Err(".splat file size must be a multiple of 32 bytes".to_string());
+    }
+    let mut points = Vec::with_capacity(data.len() / 32);
+    for record in data.chunks_exact(32) {
+        let read_f32 = |offset: usize| {
+            f32::from_le_bytes([
+                record[offset],
+                record[offset + 1],
+                record[offset + 2],
+                record[offset + 3],
+            ])
+        };
+        let scale = [read_f32(12), read_f32(16), read_f32(20)];
+        let opacity = (record[27] as f32 / 255.0).clamp(0.001, 0.999);
+        points.push(SplatPoint {
+            x: read_f32(0),
+            y: read_f32(4),
+            z: read_f32(8),
+            r: record[24],
+            g: record[25],
+            b: record[26],
+            radius: (scale[0] + scale[1] + scale[2]) / 3.0,
+            scale,
+            rotation: [
+                (record[28] as f32 - 128.0) / 128.0,
+                (record[29] as f32 - 128.0) / 128.0,
+                (record[30] as f32 - 128.0) / 128.0,
+                (record[31] as f32 - 128.0) / 128.0,
+            ],
+            opacity_logit: (opacity / (1.0 - opacity)).ln(),
+        });
+    }
+    Ok(points)
+}
+
 fn property_index(properties: &[String], name: &str) -> Result<usize, String> {
     property_index_opt(properties, name).ok_or_else(|| format!("MLX PLY missing property {name}"))
 }
@@ -1302,12 +1650,12 @@ fn export_fbx_native(
     write_fbx(
         fbx_path,
         FbxMesh {
-            name: "tomato_surface",
+            name: "scan_surface",
             vertices: &visual_vertices,
             triangles: &visual_triangles,
         },
         FbxMesh {
-            name: "UCX_tomato_surface_00",
+            name: "UCX_scan_surface_00",
             vertices: &collider_vertices,
             triangles: &collider_triangles,
         },
@@ -1386,11 +1734,15 @@ fn find_system_python() -> Option<String> {
 }
 
 fn mlx_venv_dir() -> PathBuf {
-    dirs::data_local_dir()
+    let data_root = dirs::data_local_dir()
         .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Tomato Twin Capture")
-        .join("mlx-3dgs-venv")
+        .unwrap_or_else(std::env::temp_dir);
+    let legacy = data_root.join("Tomato Twin Capture").join("mlx-3dgs-venv");
+    if legacy.exists() {
+        legacy
+    } else {
+        data_root.join("AgriScan Studio").join("mlx-3dgs-venv")
+    }
 }
 
 fn mlx_venv_python(venv_dir: &Path) -> PathBuf {
@@ -1522,12 +1874,6 @@ struct DepthImage {
     z16: Vec<u16>,
 }
 
-struct RgbImage {
-    width: u32,
-    height: u32,
-    rgb: Vec<u8>,
-}
-
 fn read_depth_png(path: &str) -> Result<DepthImage, String> {
     let file = File::open(path).map_err(|error| format!("failed to open depth PNG: {error}"))?;
     let decoder = Decoder::new(BufReader::new(file));
@@ -1553,7 +1899,7 @@ fn read_depth_png(path: &str) -> Result<DepthImage, String> {
     })
 }
 
-fn read_rgb_png(path: &str) -> Result<RgbImage, String> {
+fn read_rgb_png(path: &str) -> Result<ColorFrame, String> {
     let mut file = File::open(path).map_err(|error| format!("failed to open RGB PNG: {error}"))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -1575,7 +1921,7 @@ fn read_rgb_png(path: &str) -> Result<RgbImage, String> {
             .collect(),
         _ => return Err("RGB PNG must be 8-bit RGB/RGBA".to_string()),
     };
-    Ok(RgbImage {
+    Ok(ColorFrame {
         width: info.width,
         height: info.height,
         rgb,
@@ -1583,7 +1929,7 @@ fn read_rgb_png(path: &str) -> Result<RgbImage, String> {
 }
 
 fn sample_rgb(
-    image: Option<&RgbImage>,
+    image: Option<&ColorFrame>,
     x: usize,
     y: usize,
     depth_width: usize,
@@ -1627,10 +1973,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock before unix epoch")
             .as_nanos();
-        let session_root = std::env::temp_dir().join(format!(
-            "tomato-twin-assets-{}-{stamp}",
-            std::process::id()
-        ));
+        let session_root =
+            std::env::temp_dir().join(format!("tomato-twin-assets-{}-{stamp}", std::process::id()));
         let rgb_dir = session_root.join("rgb");
         let depth_dir = session_root.join("depth_z16");
         let metadata_dir = session_root.join("metadata");
@@ -1729,11 +2073,7 @@ mod tests {
         let mut rgb = Vec::with_capacity((width * height * 3) as usize);
         for y in 0..height {
             for x in 0..width {
-                rgb.extend_from_slice(&[
-                    180 + (x % 40) as u8,
-                    35 + (y % 50) as u8,
-                    28,
-                ]);
+                rgb.extend_from_slice(&[180 + (x % 40) as u8, 35 + (y % 50) as u8, 28]);
             }
         }
         writer.write_image_data(&rgb).expect("write RGB PNG");

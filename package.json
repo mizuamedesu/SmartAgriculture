@@ -1,5 +1,5 @@
 {
-  "name": "smart-agriculture-tomato-twin",
+  "name": "smart-agriculture-agriscan",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide": "^0.468.0",

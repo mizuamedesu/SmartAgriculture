@@ -1,7 +1,7 @@
 [package]
 name = "smart-agriculture-tomato-twin"
 version = "0.1.0"
-description = "RealSense RGB-D capture and point-cloud export for mini tomato digital twins"
+description = "Generic RealSense RGB-D capture, 3DGS reconstruction, and asset export for agriculture"
 authors = ["SmartAgriculture"]
 edition = "2024"
 default-run = "smart-agriculture-tomato-twin"
@@ -15,13 +15,18 @@ tauri-build = { version = "2.4.0", features = [] }
 
 [dependencies]
 base64 = "0.22.1"
+cdr = "0.2.4"
 chrono = { version = "0.4.39", features = ["serde"] }
 dirs = "6.0.0"
 jpeg-encoder = "0.6.1"
+jpeg-decoder = "0.3.1"
 libc = "0.2.177"
 libloading = "0.8.6"
+mcap = "0.25.0"
+memmap2 = "0.9.7"
 png = "0.17.16"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.134"
 tauri = { version = "2.4.0", features = [] }
+tauri-plugin-dialog = "2.4.0"
 thiserror = "2.0.9"
