@@ -29,21 +29,30 @@ use realsense::ensure_realsense_sdk;
 pub fn rebuild_scan_assets_cli(session_root: &str) -> Result<String, String> {
     let result = generate_scan_assets(assets::AssetBuildOptions {
         session_root: session_root.to_string(),
-        max_points: Some(350_000),
+        max_points: Some(1_500_000),
         frame_stride: Some(1),
         depth_decimation: Some(2),
         gaussian_radius_m: Some(0.0035),
         turntable_degrees: Some(0.0),
         export_fbx: Some(true),
-        use_mlx: Some(false),
+        use_mlx: Some(true),
         mlx_iterations: Some(0),
         mlx_voxel_size_m: Some(0.0025),
-        mlx_train_size: Some(320),
-        mlx_max_train_views: Some(12),
+        mlx_train_size: Some(1536),
+        mlx_max_train_views: Some(4),
         collider_max_faces: Some(35_000),
     })?;
-    serde_json::to_string_pretty(&result)
-        .map_err(|error| format!("failed to encode asset result: {error}"))
+    serde_json::to_string_pretty(&serde_json::json!({
+        "root": result.root,
+        "pointCount": result.point_count,
+        "faceCount": result.face_count,
+        "gaussianPly": result.gaussian_ply,
+        "meshFbx": result.mesh_fbx,
+        "bounds": result.preview.bounds,
+        "mlxStatus": result.mlx_status,
+        "fbxStatus": result.fbx_status
+    }))
+    .map_err(|error| format!("failed to encode asset result: {error}"))
 }
 
 pub fn export_mcap_samples_cli(recording_path: &str, output_root: &str) -> Result<String, String> {

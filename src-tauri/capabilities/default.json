@@ -3,5 +3,11 @@
   "identifier": "main-capability",
   "description": "Allow the main window to select scan files and the global save location.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-cursor-grab",
+    "core:window:allow-set-cursor-position",
+    "core:window:allow-set-cursor-visible",
+    "dialog:allow-open"
+  ]
 }

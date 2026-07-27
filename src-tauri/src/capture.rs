@@ -1598,12 +1598,12 @@ mod tests {
                 mlx_iterations: Some(2),
                 mlx_voxel_size_m: Some(0.004),
                 mlx_train_size: Some(64),
-                mlx_max_train_views: Some(4),
+                mlx_max_train_views: Some(1),
                 collider_max_faces: Some(5_000),
             })
-            .expect("run gsplat-mlx refinement on recorded frames");
+            .expect("run pretrained SHARP MLX inference on recorded frames");
             assert!(refined.gaussian_ply.ends_with("scan_gaussians_mlx.ply"));
-            assert!(refined.mlx_status.contains("gsplat-mlx"));
+            assert!(refined.mlx_status.contains("SHARP MLX"));
             assert!(PathBuf::from(refined.splat).is_file());
         }
         let _ = fs::remove_dir_all(&output_root);

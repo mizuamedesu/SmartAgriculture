@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
@@ -185,6 +186,14 @@ interface PreviewPayload {
     max: [number, number, number];
     center: [number, number, number];
   };
+  initialCamera?: {
+    rotation: [
+      [number, number, number],
+      [number, number, number],
+      [number, number, number]
+    ];
+    translation: [number, number, number];
+  } | null;
 }
 
 interface AssetBuildResult {
@@ -236,17 +245,17 @@ function App() {
     maxDepthM: 1.4
   });
   const [assetOptions, setAssetOptions] = useState<AssetOptions>({
-    maxPoints: 350000,
+    maxPoints: 1500000,
     frameStride: 1,
     depthDecimation: 2,
     gaussianRadiusM: 0.0035,
     turntableDegrees: 0,
     exportFbx: true,
     useMlx: true,
-    mlxIterations: 1600,
+    mlxIterations: 0,
     mlxVoxelSizeM: 0.0025,
-    mlxTrainSize: 320,
-    mlxMaxTrainViews: 12,
+    mlxTrainSize: 1536,
+    mlxMaxTrainViews: 4,
     colliderMaxFaces: 35000
   });
   const [recording, setRecording] = useState(false);
@@ -352,7 +361,7 @@ function App() {
 
   const setupMlx3dgs = async (): Promise<AssetTools | null> => {
     setMlxSetupBusy(true);
-    pushLog("installing MLX 3DGS backend: mlx + gsplat-mlx");
+    pushLog("installing pretrained SHARP inference: MLX + fp16 checkpoint");
     try {
       const result = await tauriCall<MlxSetupResult>("ensure_mlx_3dgs");
       setAssetTools(result.tools);
@@ -674,7 +683,7 @@ function App() {
       return;
     }
     setAssetBusy(true);
-    pushLog(assetOptions.useMlx ? "building MLX-refined 3DGS, collider, OBJ, and FBX" : "building 3DGS seed, collider, OBJ, and FBX");
+    pushLog(assetOptions.useMlx ? "running pretrained SHARP inference and building 3DGS / FBX" : "building RGB-D 3DGS seed / FBX");
     try {
       if (assetOptions.useMlx && !assetTools?.mlxAvailable) {
         pushLog("MLX backend is not ready; setting it up before generation");
@@ -1386,7 +1395,7 @@ function AssetCommandPanel(props: {
             />
           </div>
           <label className="flex items-center justify-between rounded-xl border bg-muted/25 p-3 text-sm">
-            <span className="font-medium">MLX refinement</span>
+            <span className="font-medium">Pretrained SHARP</span>
             <input
               className="h-4 w-4 rounded border-input accent-emerald-700"
               type="checkbox"
@@ -1633,10 +1642,7 @@ function ControlPanel(props: {
             <NumberField label="Depth sampling" value={props.assetOptions.depthDecimation} min={1} max={16} onChange={(v) => updateAsset("depthDecimation", v)} />
             <NumberField label="Point limit" value={props.assetOptions.maxPoints} min={5000} max={1500000} step={1000} onChange={(v) => updateAsset("maxPoints", v)} />
             <NumberField label="Radius m" value={props.assetOptions.gaussianRadiusM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("gaussianRadiusM", v)} />
-            <NumberField label="MLX iters" value={props.assetOptions.mlxIterations} min={0} max={20000} step={100} onChange={(v) => updateAsset("mlxIterations", v)} />
-            <NumberField label="Voxel m" value={props.assetOptions.mlxVoxelSizeM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("mlxVoxelSizeM", v)} />
-            <NumberField label="Train px" value={props.assetOptions.mlxTrainSize} min={64} max={1024} step={32} onChange={(v) => updateAsset("mlxTrainSize", v)} />
-            <NumberField label="Train views" value={props.assetOptions.mlxMaxTrainViews} min={1} max={64} onChange={(v) => updateAsset("mlxMaxTrainViews", v)} />
+            <NumberField label="Inference views" value={props.assetOptions.mlxMaxTrainViews} min={1} max={4} onChange={(v) => updateAsset("mlxMaxTrainViews", v)} />
             <NumberField label="Collider faces" value={props.assetOptions.colliderMaxFaces} min={500} max={120000} step={500} onChange={(v) => updateAsset("colliderMaxFaces", v)} />
             <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
               <input
@@ -1645,7 +1651,7 @@ function ControlPanel(props: {
                 checked={props.assetOptions.useMlx}
                 onChange={(event) => updateAsset("useMlx", event.target.checked)}
               />
-              MLX refine
+              Pretrained SHARP
             </label>
             <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
               <input
@@ -1859,7 +1865,7 @@ function OutputPanel(props: {
           </Button>
           <Button className="w-full" variant="secondary" onClick={props.setupMlx3dgs} disabled={props.mlxSetupBusy || props.recording}>
             <WandSparkles className={cn("h-4 w-4", props.mlxSetupBusy && "animate-pulse")} />
-            {props.mlxSetupBusy ? "Installing 3DGS" : "Setup MLX 3DGS"}
+            {props.mlxSetupBusy ? "Installing SHARP" : "Setup SHARP MLX"}
           </Button>
           <Button
             className="w-full"
@@ -2028,6 +2034,7 @@ function PathRow({ label, value }: { label: string; value: string }) {
 function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [rendererError, setRendererError] = useState<string | null>(null);
+  const [mouseCaptured, setMouseCaptured] = useState(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2068,12 +2075,14 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-    const stride = 8 * Float32Array.BYTES_PER_ELEMENT;
+    const instanceStride = 14;
+    const stride = instanceStride * Float32Array.BYTES_PER_ELEMENT;
     gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
     for (const [location, size, offset] of [
       [1, 3, 0],
       [2, 4, 3],
-      [3, 1, 7]
+      [3, 3, 7],
+      [4, 4, 10]
     ] as const) {
       gl.enableVertexAttribArray(location);
       gl.vertexAttribPointer(location, size, gl.FLOAT, false, stride, offset * Float32Array.BYTES_PER_ELEMENT);
@@ -2091,9 +2100,11 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
           0.1
         )
       : 1;
-    const packed = new Float32Array(points.length * 8);
+    const packed = new Float32Array(points.length * instanceStride);
     points.forEach((point, index) => {
-      const offset = index * 8;
+      const offset = index * instanceStride;
+      const scale = point.scale ?? [point.radius, point.radius, point.radius];
+      const rotation = point.rotation ?? [1, 0, 0, 0];
       packed[offset] = point.x - center[0];
       packed[offset + 1] = point.y - center[1];
       packed[offset + 2] = point.z - center[2];
@@ -2101,7 +2112,13 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       packed[offset + 4] = point.g / 255;
       packed[offset + 5] = point.b / 255;
       packed[offset + 6] = Math.min(1, Math.max(0.02, point.opacity ?? 0.85));
-      packed[offset + 7] = Math.max(point.radius, ...(point.scale ?? [point.radius, point.radius, point.radius]));
+      packed[offset + 7] = Math.max(0.00001, scale[0]);
+      packed[offset + 8] = Math.max(0.00001, scale[1]);
+      packed[offset + 9] = Math.max(0.00001, scale[2]);
+      packed[offset + 10] = rotation[0];
+      packed[offset + 11] = rotation[1];
+      packed[offset + 12] = rotation[2];
+      packed[offset + 13] = rotation[3];
     });
     const order = Array.from({ length: points.length }, (_, index) => index);
     const sorted = new Float32Array(packed.length);
@@ -2109,14 +2126,47 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     const projectionLocation = gl.getUniformLocation(program, "u_projection");
     const viewportLocation = gl.getUniformLocation(program, "u_viewport");
     const rotationLocation = gl.getUniformLocation(program, "u_rotation");
-    const distanceLocation = gl.getUniformLocation(program, "u_distance");
-    const translationLocation = gl.getUniformLocation(program, "u_translation");
+    const baseRow0Location = gl.getUniformLocation(program, "u_base_row0");
+    const baseRow1Location = gl.getUniformLocation(program, "u_base_row1");
+    const baseRow2Location = gl.getUniformLocation(program, "u_base_row2");
+    const cameraPositionLocation = gl.getUniformLocation(program, "u_camera_position");
+    const recordedCamera = payload?.initialCamera;
+    const baseRows: [[number, number, number], [number, number, number], [number, number, number]] =
+      recordedCamera
+        ? [
+            [recordedCamera.rotation[0][0], recordedCamera.rotation[1][0], recordedCamera.rotation[2][0]],
+            [recordedCamera.rotation[0][1], recordedCamera.rotation[1][1], recordedCamera.rotation[2][1]],
+            [recordedCamera.rotation[0][2], recordedCamera.rotation[1][2], recordedCamera.rotation[2][2]]
+          ]
+        : [
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1]
+          ];
+    const centerFromCamera: [number, number, number] = recordedCamera
+      ? [
+          center[0] - recordedCamera.translation[0],
+          center[1] - recordedCamera.translation[1],
+          center[2] - recordedCamera.translation[2]
+        ]
+      : [0, 0, 0];
+    const baseOffset: [number, number, number] = [
+      dotVector3(baseRows[0], centerFromCamera),
+      dotVector3(baseRows[1], centerFromCamera),
+      dotVector3(baseRows[2], centerFromCamera)
+    ];
     let yaw = 0;
     let pitch = 0;
-    let distance = span * 2.7;
-    const translation: [number, number, number] = [0, 0, 0];
+    const cameraPosition: [number, number, number] =
+      recordedCamera && baseOffset[2] < -span * 0.02
+        ? [-baseOffset[0], -baseOffset[1], -baseOffset[2]]
+        : [0, 0, span * 0.85];
     const movementKeys = new Set<string>();
+    const appWindow = isTauri ? getCurrentWindow() : null;
+    let nativeMouseCaptured = false;
     let dragging = false;
+    let sortDirty = false;
+    let lastSortTime = performance.now();
     let previousX = 0;
     let previousY = 0;
     let animation = 0;
@@ -2128,19 +2178,27 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       const cosPitch = Math.cos(pitch);
       const sinPitch = Math.sin(pitch);
       const depth = (index: number) => {
-        const offset = index * 8;
+        const offset = index * instanceStride;
         const x = packed[offset];
         const y = packed[offset + 1];
         const z = packed[offset + 2];
-        const yawZ = x * sinYaw + z * cosYaw;
-        return y * sinPitch + yawZ * cosPitch;
+        const baseX = baseRows[0][0] * x + baseRows[0][1] * y + baseRows[0][2] * z;
+        const baseY = baseRows[1][0] * x + baseRows[1][1] * y + baseRows[1][2] * z;
+        const baseZ = baseRows[2][0] * x + baseRows[2][1] * y + baseRows[2][2] * z;
+        const yawZ = baseX * sinYaw + baseZ * cosYaw;
+        return baseY * sinPitch + yawZ * cosPitch;
       };
       order.sort((a, b) => depth(a) - depth(b));
       order.forEach((sourceIndex, targetIndex) => {
-        sorted.set(packed.subarray(sourceIndex * 8, sourceIndex * 8 + 8), targetIndex * 8);
+        sorted.set(
+          packed.subarray(sourceIndex * instanceStride, sourceIndex * instanceStride + instanceStride),
+          targetIndex * instanceStride
+        );
       });
       gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, sorted, gl.DYNAMIC_DRAW);
+      sortDirty = false;
+      lastSortTime = performance.now();
     };
 
     const resize = () => {
@@ -2158,40 +2216,131 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     resize();
     uploadSortedPoints();
 
+    const releaseMouseCapture = async () => {
+      movementKeys.clear();
+      if (document.pointerLockElement === canvas) document.exitPointerLock();
+      if (nativeMouseCaptured && appWindow) {
+        nativeMouseCaptured = false;
+        await Promise.allSettled([
+          appWindow.setCursorGrab(false),
+          appWindow.setCursorVisible(true)
+        ]);
+      }
+      setMouseCaptured(false);
+    };
+    const captureMouse = async () => {
+      canvas.focus({ preventScroll: true });
+      if (nativeMouseCaptured || document.pointerLockElement === canvas) return;
+      if (appWindow) {
+        const bounds = canvas.getBoundingClientRect();
+        try {
+          await appWindow.setCursorPosition(
+            new LogicalPosition(bounds.left + bounds.width * 0.5, bounds.top + bounds.height * 0.5)
+          );
+          await appWindow.setCursorGrab(true);
+          await appWindow.setCursorVisible(false);
+          nativeMouseCaptured = true;
+          setMouseCaptured(true);
+          return;
+        } catch (error) {
+          nativeMouseCaptured = false;
+          await Promise.allSettled([
+            appWindow.setCursorGrab(false),
+            appWindow.setCursorVisible(true)
+          ]);
+          console.error("native mouse capture failed", error);
+        }
+      }
+      if (typeof canvas.requestPointerLock === "function") {
+        try {
+          await canvas.requestPointerLock();
+          return;
+        } catch (error) {
+          console.error("browser pointer lock failed", error);
+        }
+      }
+      setRendererError("Mouse capture is unavailable");
+    };
     const onPointerDown = (event: PointerEvent) => {
+      canvas.focus({ preventScroll: true });
+      if (isTauri || typeof canvas.requestPointerLock === "function") {
+        void captureMouse();
+        return;
+      }
+      if (document.pointerLockElement === canvas) return;
       dragging = true;
       previousX = event.clientX;
       previousY = event.clientY;
-      canvas.focus({ preventScroll: true });
       canvas.setPointerCapture(event.pointerId);
     };
     const onPointerMove = (event: PointerEvent) => {
-      if (!dragging) return;
-      yaw += (event.clientX - previousX) * 0.008;
-      pitch = Math.max(-1.35, Math.min(1.35, pitch + (event.clientY - previousY) * 0.008));
+      if (!dragging || document.pointerLockElement === canvas) return;
+      yaw -= (event.clientX - previousX) * 0.003;
+      pitch = Math.max(-1.5, Math.min(1.5, pitch + (event.clientY - previousY) * 0.003));
       previousX = event.clientX;
       previousY = event.clientY;
-      uploadSortedPoints();
+      sortDirty = true;
     };
     const onPointerUp = (event: PointerEvent) => {
       dragging = false;
       if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      if (sortDirty) uploadSortedPoints();
+    };
+    const onMouseMove = (event: MouseEvent) => {
+      if (!nativeMouseCaptured && document.pointerLockElement !== canvas) return;
+      yaw -= event.movementX * 0.0022;
+      pitch = Math.max(-1.5, Math.min(1.5, pitch + event.movementY * 0.0022));
+      sortDirty = true;
+    };
+    const onPointerLockChange = () => {
+      if (nativeMouseCaptured) return;
+      const captured = document.pointerLockElement === canvas;
+      setMouseCaptured(captured);
+      if (!captured && sortDirty) uploadSortedPoints();
+    };
+    const onPointerLockError = () => {
+      if (nativeMouseCaptured) return;
+      setMouseCaptured(false);
     };
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      distance = Math.max(span * 0.08, Math.min(span * 80, distance * Math.exp(event.deltaY * 0.001)));
+      const amount = Math.min(120, Math.abs(event.deltaY)) * span * 0.0007;
+      moveCamera(event.deltaY < 0 ? "w" : "s", amount);
     };
     const moveCamera = (key: string, amount: number) => {
-      if (key === "w") translation[2] += amount;
-      if (key === "s") translation[2] -= amount;
-      if (key === "a") translation[0] += amount;
-      if (key === "d") translation[0] -= amount;
-      if (key === "q") translation[1] += amount;
-      if (key === "e") translation[1] -= amount;
+      const sinYaw = Math.sin(yaw);
+      const cosYaw = Math.cos(yaw);
+      const forwardX = -sinYaw;
+      const forwardZ = -cosYaw;
+      const rightX = cosYaw;
+      const rightZ = -sinYaw;
+      if (key === "w") {
+        cameraPosition[0] += forwardX * amount;
+        cameraPosition[2] += forwardZ * amount;
+      }
+      if (key === "s") {
+        cameraPosition[0] -= forwardX * amount;
+        cameraPosition[2] -= forwardZ * amount;
+      }
+      if (key === "a") {
+        cameraPosition[0] -= rightX * amount;
+        cameraPosition[2] -= rightZ * amount;
+      }
+      if (key === "d") {
+        cameraPosition[0] += rightX * amount;
+        cameraPosition[2] += rightZ * amount;
+      }
+      if (key === "q") cameraPosition[1] -= amount;
+      if (key === "e") cameraPosition[1] += amount;
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const key = event.key.toLowerCase();
+      if (key === "escape" && (nativeMouseCaptured || document.pointerLockElement === canvas)) {
+        event.preventDefault();
+        void releaseMouseCapture();
+        return;
+      }
       if (!["w", "a", "s", "d", "q", "e", "shift"].includes(key)) return;
       event.preventDefault();
       if (key !== "shift" && !event.repeat) {
@@ -2208,6 +2357,9 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     const onBlur = () => {
       movementKeys.clear();
     };
+    const onWindowBlur = () => {
+      void releaseMouseCapture();
+    };
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
@@ -2216,6 +2368,10 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
     canvas.addEventListener("keydown", onKeyDown);
     canvas.addEventListener("keyup", onKeyUp);
     canvas.addEventListener("blur", onBlur);
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("pointerlockchange", onPointerLockChange);
+    document.addEventListener("pointerlockerror", onPointerLockError);
+    window.addEventListener("blur", onWindowBlur);
 
     gl.useProgram(program);
     gl.enable(gl.BLEND);
@@ -2229,6 +2385,7 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
         const speed = span * (movementKeys.has("shift") ? 1.8 : 0.55) * delta;
         movementKeys.forEach((key) => moveCamera(key, speed));
       }
+      if (sortDirty && time - lastSortTime >= 240) uploadSortedPoints();
       resize();
       gl.clearColor(0.035, 0.035, 0.043, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
@@ -2237,8 +2394,10 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
         gl.uniformMatrix4fv(projectionLocation, false, perspectiveMatrix(Math.PI / 4, aspect, span * 0.002, span * 200));
         gl.uniform2f(viewportLocation, canvas.width, canvas.height);
         gl.uniform2f(rotationLocation, yaw, pitch);
-        gl.uniform1f(distanceLocation, distance);
-        gl.uniform3f(translationLocation, translation[0], translation[1], translation[2]);
+        gl.uniform3f(baseRow0Location, baseRows[0][0], baseRows[0][1], baseRows[0][2]);
+        gl.uniform3f(baseRow1Location, baseRows[1][0], baseRows[1][1], baseRows[1][2]);
+        gl.uniform3f(baseRow2Location, baseRows[2][0], baseRows[2][1], baseRows[2][2]);
+        gl.uniform3f(cameraPositionLocation, cameraPosition[0], cameraPosition[1], cameraPosition[2]);
         gl.bindVertexArray(vao);
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, points.length);
         gl.bindVertexArray(null);
@@ -2258,6 +2417,11 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
       canvas.removeEventListener("keydown", onKeyDown);
       canvas.removeEventListener("keyup", onKeyUp);
       canvas.removeEventListener("blur", onBlur);
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("pointerlockchange", onPointerLockChange);
+      document.removeEventListener("pointerlockerror", onPointerLockError);
+      window.removeEventListener("blur", onWindowBlur);
+      void releaseMouseCapture();
       gl.deleteBuffer(instanceBuffer);
       gl.deleteBuffer(quadBuffer);
       gl.deleteVertexArray(vao);
@@ -2272,13 +2436,18 @@ function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
         width={1000}
         height={620}
         tabIndex={0}
-        aria-label="Interactive 3D Gaussian preview. Drag to rotate, use the mouse wheel to zoom, and use W A S D Q E to move."
-        className="h-[calc(100vh-220px)] min-h-[520px] max-h-[760px] w-full touch-none cursor-grab rounded-2xl border border-black/15 bg-zinc-950 outline-none active:cursor-grabbing focus:ring-2 focus:ring-primary focus:ring-offset-2"
+        aria-label="Interactive first-person 3D Gaussian preview. Click to capture the mouse, look around with the mouse, and use W A S D Q E to move."
+        className={cn(
+          "h-[calc(100vh-220px)] min-h-[520px] max-h-[760px] w-full touch-none rounded-2xl border border-black/15 bg-zinc-950 outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2",
+          mouseCaptured ? "cursor-none" : "cursor-crosshair"
+        )}
       />
       <div className="pointer-events-none absolute bottom-3 left-3 rounded bg-black/55 px-2 py-1 text-[11px] text-zinc-300">
         {rendererError ??
           (payload?.points.length
-            ? "Static preview · drag: rotate · wheel: zoom · click then WASD: move · Q/E: down/up · Shift: faster"
+            ? mouseCaptured
+              ? "FPS control · mouse: look · WASD: move · Q/E: down/up · Shift: faster · Esc: release mouse"
+              : "Click 3DGS to control · mouse: look · WASD: move · Q/E: down/up"
             : "3DGS preview appears here")}
       </div>
     </div>
@@ -2291,41 +2460,96 @@ function createSplatProgram(gl: WebGL2RenderingContext) {
     layout(location = 0) in vec2 a_corner;
     layout(location = 1) in vec3 a_center;
     layout(location = 2) in vec4 a_color;
-    layout(location = 3) in float a_radius;
+    layout(location = 3) in vec3 a_scale;
+    layout(location = 4) in vec4 a_quaternion;
     uniform mat4 u_projection;
     uniform vec2 u_viewport;
     uniform vec2 u_rotation;
-    uniform float u_distance;
-    uniform vec3 u_translation;
+    uniform vec3 u_base_row0;
+    uniform vec3 u_base_row1;
+    uniform vec3 u_base_row2;
+    uniform vec3 u_camera_position;
     out vec2 v_uv;
     out vec4 v_color;
 
-    void main() {
+    vec3 applyBaseRotation(vec3 value) {
+      return vec3(
+        dot(u_base_row0, value),
+        dot(u_base_row1, value),
+        dot(u_base_row2, value)
+      );
+    }
+
+    vec3 applyViewRotation(vec3 value) {
       float cy = cos(u_rotation.x);
       float sy = sin(u_rotation.x);
       float cp = cos(u_rotation.y);
       float sp = sin(u_rotation.y);
       vec3 yawed = vec3(
-        a_center.x * cy - a_center.z * sy,
-        a_center.y,
-        a_center.x * sy + a_center.z * cy
+        value.x * cy - value.z * sy,
+        value.y,
+        value.x * sy + value.z * cy
       );
-      vec3 view = vec3(
+      return vec3(
         yawed.x,
         yawed.y * cp - yawed.z * sp,
-        yawed.y * sp + yawed.z * cp - u_distance
+        yawed.y * sp + yawed.z * cp
       );
-      view += u_translation;
+    }
+
+    vec3 rotateByQuaternion(vec4 inputQuaternion, vec3 value) {
+      vec4 quaternion = inputQuaternion / max(length(inputQuaternion), 0.000001);
+      vec3 imaginary = quaternion.yzw;
+      return value + 2.0 * (
+        quaternion.x * cross(imaginary, value) +
+        cross(imaginary, cross(imaginary, value))
+      );
+    }
+
+    vec2 projectAxis(vec3 view, vec3 axis) {
+      float depth = max(0.001, -view.z);
+      float focalX = u_projection[0][0] * u_viewport.x * 0.5;
+      float focalY = u_projection[1][1] * u_viewport.y * 0.5;
+      float depthSquared = depth * depth;
+      return vec2(
+        focalX * (axis.x * depth + view.x * axis.z) / depthSquared,
+        focalY * (axis.y * depth + view.y * axis.z) / depthSquared
+      );
+    }
+
+    void main() {
+      vec3 baseCenter = applyBaseRotation(a_center);
+      vec3 view = applyViewRotation(baseCenter - u_camera_position);
       vec4 clip = u_projection * vec4(view, 1.0);
-      float radius_px = clamp(
-        a_radius * 3.0 * u_projection[1][1] * u_viewport.y * 0.5 / max(0.001, -view.z),
-        1.2,
-        96.0
-      );
-      vec2 clip_offset = a_corner * radius_px * 2.0 / u_viewport * clip.w;
+
+      vec3 worldAxis0 = rotateByQuaternion(a_quaternion, vec3(a_scale.x, 0.0, 0.0));
+      vec3 worldAxis1 = rotateByQuaternion(a_quaternion, vec3(0.0, a_scale.y, 0.0));
+      vec3 worldAxis2 = rotateByQuaternion(a_quaternion, vec3(0.0, 0.0, a_scale.z));
+      vec2 projected0 = projectAxis(view, applyViewRotation(applyBaseRotation(worldAxis0)));
+      vec2 projected1 = projectAxis(view, applyViewRotation(applyBaseRotation(worldAxis1)));
+      vec2 projected2 = projectAxis(view, applyViewRotation(applyBaseRotation(worldAxis2)));
+
+      float covarianceXX =
+        dot(vec3(projected0.x, projected1.x, projected2.x), vec3(projected0.x, projected1.x, projected2.x)) + 0.30;
+      float covarianceXY =
+        projected0.x * projected0.y + projected1.x * projected1.y + projected2.x * projected2.y;
+      float covarianceYY =
+        dot(vec3(projected0.y, projected1.y, projected2.y), vec3(projected0.y, projected1.y, projected2.y)) + 0.30;
+      float trace = covarianceXX + covarianceYY;
+      float difference = covarianceXX - covarianceYY;
+      float discriminant = sqrt(max(0.0, difference * difference + 4.0 * covarianceXY * covarianceXY));
+      float eigenvalue1 = max(0.25, 0.5 * (trace + discriminant));
+      float eigenvalue2 = max(0.25, 0.5 * (trace - discriminant));
+      float angle = 0.5 * atan(2.0 * covarianceXY, difference);
+      vec2 direction1 = vec2(cos(angle), sin(angle));
+      vec2 direction2 = vec2(-direction1.y, direction1.x);
+      vec2 axis1 = direction1 * clamp(3.0 * sqrt(eigenvalue1), 0.65, 52.0);
+      vec2 axis2 = direction2 * clamp(3.0 * sqrt(eigenvalue2), 0.65, 52.0);
+      vec2 pixelOffset = axis1 * a_corner.x + axis2 * a_corner.y;
+      vec2 clip_offset = pixelOffset * 2.0 / u_viewport * clip.w;
       gl_Position = clip + vec4(clip_offset, 0.0, 0.0);
       v_uv = a_corner;
-      v_color = a_color;
+      v_color = view.z < -0.001 ? a_color : vec4(a_color.rgb, 0.0);
     }`;
   const fragmentSource = `#version 300 es
     precision highp float;
@@ -2369,6 +2593,13 @@ function compileShader(gl: WebGL2RenderingContext, type: number, source: string)
     return null;
   }
   return shader;
+}
+
+function dotVector3(
+  left: [number, number, number],
+  right: [number, number, number]
+) {
+  return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
 }
 
 function perspectiveMatrix(fov: number, aspect: number, near: number, far: number) {
@@ -2437,7 +2668,7 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   }
   if (command === "ensure_mlx_3dgs") {
     return {
-      status: "Preview mode: gsplat-mlx setup runs only inside Tauri",
+      status: "Preview mode: SHARP MLX setup runs only inside Tauri",
       log: ["Preview mode"],
       tools: {
         fbxAvailable: true,

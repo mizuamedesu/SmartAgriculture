@@ -106,15 +106,10 @@ type Rs2PipelineStartWithConfig = unsafe extern "C" fn(
 type Rs2DeletePipelineProfile = unsafe extern "C" fn(*mut Rs2PipelineProfile);
 type Rs2PipelineWaitForFrames =
     unsafe extern "C" fn(*mut Rs2Pipeline, c_uint, *mut *mut Rs2Error) -> *mut Rs2Frame;
-type Rs2CreateAlign =
-    unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2ProcessingBlock;
-type Rs2CreateFrameQueue =
-    unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2FrameQueue;
-type Rs2StartProcessingQueue = unsafe extern "C" fn(
-    *mut Rs2ProcessingBlock,
-    *mut Rs2FrameQueue,
-    *mut *mut Rs2Error,
-);
+type Rs2CreateAlign = unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2ProcessingBlock;
+type Rs2CreateFrameQueue = unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2FrameQueue;
+type Rs2StartProcessingQueue =
+    unsafe extern "C" fn(*mut Rs2ProcessingBlock, *mut Rs2FrameQueue, *mut *mut Rs2Error);
 type Rs2ProcessFrame =
     unsafe extern "C" fn(*mut Rs2ProcessingBlock, *mut Rs2Frame, *mut *mut Rs2Error);
 type Rs2WaitForFrame =
@@ -756,9 +751,9 @@ impl RealSenseCamera {
     }
 
     fn initialize_alignment(&mut self) -> Result<(), String> {
-        self.align = self.api.call(|error| unsafe {
-            (self.api.rs2_create_align)(RS2_STREAM_COLOR, error)
-        })?;
+        self.align = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_create_align)(RS2_STREAM_COLOR, error) })?;
         if self.align.is_null() {
             return Err("rs2_create_align returned null".to_string());
         }
