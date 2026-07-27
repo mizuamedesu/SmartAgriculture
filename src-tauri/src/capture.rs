@@ -16,7 +16,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::{realsense, storage};
 
-pub(crate) const REALSENSE_HELPER_PROTOCOL: &str = "agriscan-realsense-helper-mcap-v2";
+pub(crate) const REALSENSE_HELPER_PROTOCOL: &str = "agriscan-realsense-helper-mcap-v3-aligned-rgbd";
 
 #[derive(Default)]
 pub struct AppState {
@@ -1557,7 +1557,7 @@ mod tests {
             frame_stride: Some(1),
             depth_decimation: Some(2),
             gaussian_radius_m: Some(0.006),
-            turntable_degrees: Some(360.0),
+            turntable_degrees: Some(0.0),
             export_fbx: Some(true),
             use_mlx: Some(false),
             mlx_iterations: Some(0),
@@ -1592,7 +1592,7 @@ mod tests {
                 frame_stride: Some(1),
                 depth_decimation: Some(4),
                 gaussian_radius_m: Some(0.006),
-                turntable_degrees: Some(360.0),
+                turntable_degrees: Some(0.0),
                 export_fbx: Some(true),
                 use_mlx: Some(true),
                 mlx_iterations: Some(2),

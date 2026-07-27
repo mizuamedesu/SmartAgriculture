@@ -37,6 +37,8 @@ type Rs2Config = c_void;
 type Rs2PipelineProfile = c_void;
 type Rs2Frame = c_void;
 type Rs2StreamProfile = c_void;
+type Rs2ProcessingBlock = c_void;
+type Rs2FrameQueue = c_void;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -104,6 +106,21 @@ type Rs2PipelineStartWithConfig = unsafe extern "C" fn(
 type Rs2DeletePipelineProfile = unsafe extern "C" fn(*mut Rs2PipelineProfile);
 type Rs2PipelineWaitForFrames =
     unsafe extern "C" fn(*mut Rs2Pipeline, c_uint, *mut *mut Rs2Error) -> *mut Rs2Frame;
+type Rs2CreateAlign =
+    unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2ProcessingBlock;
+type Rs2CreateFrameQueue =
+    unsafe extern "C" fn(c_int, *mut *mut Rs2Error) -> *mut Rs2FrameQueue;
+type Rs2StartProcessingQueue = unsafe extern "C" fn(
+    *mut Rs2ProcessingBlock,
+    *mut Rs2FrameQueue,
+    *mut *mut Rs2Error,
+);
+type Rs2ProcessFrame =
+    unsafe extern "C" fn(*mut Rs2ProcessingBlock, *mut Rs2Frame, *mut *mut Rs2Error);
+type Rs2WaitForFrame =
+    unsafe extern "C" fn(*mut Rs2FrameQueue, c_uint, *mut *mut Rs2Error) -> *mut Rs2Frame;
+type Rs2DeleteFrameQueue = unsafe extern "C" fn(*mut Rs2FrameQueue);
+type Rs2DeleteProcessingBlock = unsafe extern "C" fn(*mut Rs2ProcessingBlock);
 type Rs2ReleaseFrame = unsafe extern "C" fn(*mut Rs2Frame);
 type Rs2EmbeddedFramesCount = unsafe extern "C" fn(*mut Rs2Frame, *mut *mut Rs2Error) -> c_int;
 type Rs2ExtractFrame =
@@ -155,6 +172,13 @@ struct Rs2Api {
     rs2_pipeline_start_with_config: Rs2PipelineStartWithConfig,
     rs2_delete_pipeline_profile: Rs2DeletePipelineProfile,
     rs2_pipeline_wait_for_frames: Rs2PipelineWaitForFrames,
+    rs2_create_align: Rs2CreateAlign,
+    rs2_create_frame_queue: Rs2CreateFrameQueue,
+    rs2_start_processing_queue: Rs2StartProcessingQueue,
+    rs2_process_frame: Rs2ProcessFrame,
+    rs2_wait_for_frame: Rs2WaitForFrame,
+    rs2_delete_frame_queue: Rs2DeleteFrameQueue,
+    rs2_delete_processing_block: Rs2DeleteProcessingBlock,
     rs2_release_frame: Rs2ReleaseFrame,
     rs2_embedded_frames_count: Rs2EmbeddedFramesCount,
     rs2_extract_frame: Rs2ExtractFrame,
@@ -236,6 +260,19 @@ impl Rs2Api {
             rs2_pipeline_wait_for_frames: symbol!(
                 "rs2_pipeline_wait_for_frames",
                 Rs2PipelineWaitForFrames
+            ),
+            rs2_create_align: symbol!("rs2_create_align", Rs2CreateAlign),
+            rs2_create_frame_queue: symbol!("rs2_create_frame_queue", Rs2CreateFrameQueue),
+            rs2_start_processing_queue: symbol!(
+                "rs2_start_processing_queue",
+                Rs2StartProcessingQueue
+            ),
+            rs2_process_frame: symbol!("rs2_process_frame", Rs2ProcessFrame),
+            rs2_wait_for_frame: symbol!("rs2_wait_for_frame", Rs2WaitForFrame),
+            rs2_delete_frame_queue: symbol!("rs2_delete_frame_queue", Rs2DeleteFrameQueue),
+            rs2_delete_processing_block: symbol!(
+                "rs2_delete_processing_block",
+                Rs2DeleteProcessingBlock
             ),
             rs2_release_frame: symbol!("rs2_release_frame", Rs2ReleaseFrame),
             rs2_embedded_frames_count: symbol!("rs2_embedded_frames_count", Rs2EmbeddedFramesCount),
@@ -558,6 +595,8 @@ pub struct RealSenseCamera {
     pipeline: *mut Rs2Pipeline,
     config: *mut Rs2Config,
     profile: *mut Rs2PipelineProfile,
+    align: *mut Rs2ProcessingBlock,
+    align_queue: *mut Rs2FrameQueue,
     started: bool,
 }
 
@@ -659,14 +698,17 @@ impl RealSenseCamera {
             }
         };
 
-        let camera = Self {
+        let mut camera = Self {
             api,
             context,
             pipeline,
             config: rs_config,
             profile,
+            align: ptr::null_mut(),
+            align_queue: ptr::null_mut(),
             started: true,
         };
+        camera.initialize_alignment()?;
 
         let mut warmup_errors = Vec::new();
         for _ in 0..2 {
@@ -693,14 +735,42 @@ impl RealSenseCamera {
     }
 
     fn wait_frameset(&self, timeout_ms: u32) -> Result<*mut Rs2Frame, String> {
-        let frameset = self.api.call(|error| unsafe {
+        let raw_frameset = self.api.call(|error| unsafe {
             (self.api.rs2_pipeline_wait_for_frames)(self.pipeline, timeout_ms, error)
         })?;
-        if frameset.is_null() {
-            Err("rs2_pipeline_wait_for_frames returned null".to_string())
-        } else {
-            Ok(frameset)
+        if raw_frameset.is_null() {
+            return Err("rs2_pipeline_wait_for_frames returned null".to_string());
         }
+        // The processing API takes ownership of raw_frameset.
+        self.api.call(|error| unsafe {
+            (self.api.rs2_process_frame)(self.align, raw_frameset, error)
+        })?;
+        let aligned_frameset = self.api.call(|error| unsafe {
+            (self.api.rs2_wait_for_frame)(self.align_queue, timeout_ms, error)
+        })?;
+        if aligned_frameset.is_null() {
+            Err("RealSense alignment returned a null frameset".to_string())
+        } else {
+            Ok(aligned_frameset)
+        }
+    }
+
+    fn initialize_alignment(&mut self) -> Result<(), String> {
+        self.align = self.api.call(|error| unsafe {
+            (self.api.rs2_create_align)(RS2_STREAM_COLOR, error)
+        })?;
+        if self.align.is_null() {
+            return Err("rs2_create_align returned null".to_string());
+        }
+        self.align_queue = self
+            .api
+            .call(|error| unsafe { (self.api.rs2_create_frame_queue)(1, error) })?;
+        if self.align_queue.is_null() {
+            return Err("rs2_create_frame_queue returned null".to_string());
+        }
+        self.api.call(|error| unsafe {
+            (self.api.rs2_start_processing_queue)(self.align, self.align_queue, error)
+        })
     }
 
     fn read_frameset(&self, frameset: *mut Rs2Frame) -> Result<SensorFrame, String> {
@@ -915,6 +985,12 @@ impl Drop for RealSenseCamera {
                 if !error.is_null() {
                     (self.api.rs2_free_error)(error);
                 }
+            }
+            if !self.align_queue.is_null() {
+                (self.api.rs2_delete_frame_queue)(self.align_queue);
+            }
+            if !self.align.is_null() {
+                (self.api.rs2_delete_processing_block)(self.align);
             }
             if !self.profile.is_null() {
                 (self.api.rs2_delete_pipeline_profile)(self.profile);

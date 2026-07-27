@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     fs::{self, File},
     io::{BufReader, BufWriter, Cursor, Read, Write},
@@ -188,6 +188,66 @@ struct MeshBuild {
     faces: Vec<[u32; 3]>,
 }
 
+#[derive(Debug, Copy, Clone, Serialize)]
+struct RigidTransform {
+    rotation: [[f32; 3]; 3],
+    translation: [f32; 3],
+}
+
+impl RigidTransform {
+    fn identity() -> Self {
+        Self {
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation: [0.0; 3],
+        }
+    }
+
+    fn rotation_y(angle: f32) -> Self {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        Self {
+            rotation: [
+                [cos_a, 0.0, -sin_a],
+                [0.0, 1.0, 0.0],
+                [sin_a, 0.0, cos_a],
+            ],
+            translation: [0.0; 3],
+        }
+    }
+
+    fn apply(self, point: [f32; 3]) -> [f32; 3] {
+        [
+            dot3(self.rotation[0], point) + self.translation[0],
+            dot3(self.rotation[1], point) + self.translation[1],
+            dot3(self.rotation[2], point) + self.translation[2],
+        ]
+    }
+
+    fn then(self, next: Self) -> Self {
+        let mut rotation = [[0.0; 3]; 3];
+        for (row, values) in rotation.iter_mut().enumerate() {
+            for (column, value) in values.iter_mut().enumerate() {
+                *value = (0..3)
+                    .map(|index| next.rotation[row][index] * self.rotation[index][column])
+                    .sum();
+            }
+        }
+        Self {
+            rotation,
+            translation: add3(mat3_vec(next.rotation, self.translation), next.translation),
+        }
+    }
+
+}
+
+#[derive(Debug)]
+struct PositionedRgbdFrame {
+    frame: DecodedRgbdFrame,
+    camera_to_world: RigidTransform,
+    min_depth_m: f32,
+    max_depth_m: f32,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CollisionManifest {
@@ -326,6 +386,40 @@ pub fn load_scan_data(path: String) -> Result<AssetBuildResult, String> {
     }
 }
 
+pub fn export_mcap_sample_frames(
+    recording_path: &Path,
+    output_root: &Path,
+) -> Result<Vec<String>, String> {
+    let total_frames = mcap_io::frame_count(recording_path)?;
+    if total_frames == 0 {
+        return Err("MCAP contains no RGB-D frames".to_string());
+    }
+    fs::create_dir_all(output_root)
+        .map_err(|error| format!("failed to create diagnostic frame folder: {error}"))?;
+    let indices: BTreeSet<u32> = [1, total_frames.div_ceil(2) as u32, total_frames as u32]
+        .into_iter()
+        .collect();
+    let mut outputs = Vec::new();
+    mcap_io::visit_frame_indices(recording_path, &indices, |frame| {
+        let stem = format!("frame_{:06}", frame.info.frame_index);
+        if let Some(color) = &frame.color {
+            let color_path = output_root.join(format!("{stem}_rgb.png"));
+            write_rgb_png(&color_path, color)?;
+            outputs.push(path_string(&color_path));
+        }
+        let depth_path = output_root.join(format!("{stem}_depth_z16.png"));
+        write_depth_png(
+            &depth_path,
+            frame.depth.width,
+            frame.depth.height,
+            &frame.depth.z16,
+        )?;
+        outputs.push(path_string(&depth_path));
+        Ok(true)
+    })?;
+    Ok(outputs)
+}
+
 fn load_mcap_preview(recording: &Path) -> Result<AssetBuildResult, String> {
     let session_root = recording
         .parent()
@@ -336,7 +430,7 @@ fn load_mcap_preview(recording: &Path) -> Result<AssetBuildResult, String> {
         frame_stride: Some(1),
         depth_decimation: Some(2),
         gaussian_radius_m: Some(0.0035),
-        turntable_degrees: Some(360.0),
+        turntable_degrees: Some(0.0),
         export_fbx: Some(false),
         use_mlx: Some(false),
         mlx_iterations: Some(0),
@@ -506,7 +600,7 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
         .clamp(0.0005, 0.05);
     let turntable_degrees = options
         .turntable_degrees
-        .unwrap_or(360.0)
+        .unwrap_or(0.0)
         .clamp(0.0, 1080.0);
     let export_fbx = options.export_fbx.unwrap_or(true);
     let use_mlx = options.use_mlx.unwrap_or(true);
@@ -780,6 +874,7 @@ fn build_mesh(
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
     let mut frame_count = frames.len().max(1);
+    let frame_point_limit = max_points.div_ceil(frame_count);
     if frame_count == 1 {
         frame_count = 2;
     }
@@ -809,10 +904,13 @@ fn build_mesh(
             depth.height,
             &depth.z16,
             color.as_ref(),
-            angle,
+            RigidTransform::rotation_y(angle),
             depth_decimation as usize,
             max_points,
+            frame_point_limit,
             gaussian_radius_m,
+            0.02,
+            8.0,
             &mut vertices,
             &mut faces,
         );
@@ -829,8 +927,9 @@ fn build_mesh_from_mcap(
     gaussian_radius_m: f32,
     turntable_degrees: f32,
     max_train_views: u32,
-) -> Result<(MeshBuild, Vec<DecodedRgbdFrame>), String> {
+) -> Result<(MeshBuild, Vec<PositionedRgbdFrame>), String> {
     let total_frames = mcap_io::frame_count(recording_path)?;
+    let (min_depth_m, max_depth_m) = mcap_io::capture_depth_range(recording_path)?;
     if total_frames == 0 {
         return Err("MCAP contains no RGB-D frames".to_string());
     }
@@ -843,9 +942,12 @@ fn build_mesh_from_mcap(
         selected_count.min(max_train_views.max(1) as usize),
     );
     let requested_indices: BTreeSet<_> = mesh_indices.union(&training_indices).copied().collect();
+    let frame_point_limit = max_points.div_ceil(mesh_indices.len().max(1));
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
     let mut training_frames = Vec::new();
+    let mut previous_cloud = None::<Vec<[f32; 3]>>;
+    let mut previous_pose = RigidTransform::identity();
 
     mcap_io::visit_frame_indices(recording_path, &requested_indices, |frame| {
         let selected_ordinal = frame.info.frame_index.saturating_sub(1) as usize / stride;
@@ -855,6 +957,23 @@ fn build_mesh_from_mcap(
             let t = selected_ordinal as f32 / (selected_count - 1) as f32;
             t * turntable_degrees.to_radians()
         };
+        let local_cloud = build_alignment_cloud(&frame, min_depth_m, max_depth_m);
+        let camera_to_world = if turntable_degrees.abs() >= f32::EPSILON {
+            RigidTransform::rotation_y(angle)
+        } else if let Some(target_cloud) = previous_cloud.as_ref() {
+            align_depth_cloud(&local_cloud, target_cloud, previous_pose)
+        } else {
+            RigidTransform::identity()
+        };
+        previous_cloud = Some(
+            local_cloud
+                .iter()
+                .copied()
+                .map(|point| camera_to_world.apply(point))
+                .collect(),
+        );
+        previous_pose = camera_to_world;
+
         if mesh_indices.contains(&frame.info.frame_index) && vertices.len() < max_points {
             add_frame_mesh(
                 frame.info.intrinsics,
@@ -863,16 +982,24 @@ fn build_mesh_from_mcap(
                 frame.depth.height,
                 &frame.depth.z16,
                 frame.color.as_ref(),
-                angle,
+                camera_to_world,
                 depth_decimation as usize,
                 max_points,
+                frame_point_limit,
                 gaussian_radius_m,
+                min_depth_m,
+                max_depth_m,
                 &mut vertices,
                 &mut faces,
             );
         }
         if training_indices.contains(&frame.info.frame_index) {
-            training_frames.push(frame);
+            training_frames.push(PositionedRgbdFrame {
+                frame,
+                camera_to_world,
+                min_depth_m,
+                max_depth_m,
+            });
         }
         Ok(true)
     })?;
@@ -895,6 +1022,353 @@ fn sampled_frame_indices(total_frames: usize, stride: usize, sample_count: usize
         .collect()
 }
 
+fn build_alignment_cloud(
+    frame: &DecodedRgbdFrame,
+    min_depth_m: f32,
+    max_depth_m: f32,
+) -> Vec<[f32; 3]> {
+    let width = frame.depth.width as usize;
+    let height = frame.depth.height as usize;
+    let target_points = 4_000usize;
+    let step = ((width * height).div_ceil(target_points) as f64)
+        .sqrt()
+        .ceil()
+        .max(2.0) as usize;
+    let intr = frame.info.intrinsics;
+    let mut points = Vec::with_capacity(target_points);
+    for y in (0..height).step_by(step) {
+        for x in (0..width).step_by(step) {
+            let raw = frame.depth.z16[y * width + x];
+            if raw == 0 {
+                continue;
+            }
+            let z = raw as f32 * frame.info.depth_units_m;
+            if !(min_depth_m..=max_depth_m).contains(&z) {
+                continue;
+            }
+            points.push([
+                (x as f32 - intr.ppx) / intr.fx * z,
+                -((y as f32 - intr.ppy) / intr.fy * z),
+                -z,
+            ]);
+        }
+    }
+    points
+}
+
+fn align_depth_cloud(
+    source: &[[f32; 3]],
+    target_world: &[[f32; 3]],
+    initial_pose: RigidTransform,
+) -> RigidTransform {
+    if source.len() < 80 || target_world.len() < 80 {
+        return initial_pose;
+    }
+
+    const VOXEL_SIZE: f32 = 0.055;
+    let index = build_voxel_index(target_world, VOXEL_SIZE);
+    let mut pose = initial_pose;
+    for iteration in 0..10 {
+        let max_distance = match iteration {
+            0..=2 => 0.11,
+            3..=5 => 0.075,
+            6..=7 => 0.05,
+            _ => 0.035,
+        };
+        let search_radius = (max_distance / VOXEL_SIZE).ceil() as i32;
+        let max_distance_squared = max_distance * max_distance;
+        let mut pairs = Vec::with_capacity(source.len());
+        for point in source {
+            let transformed = pose.apply(*point);
+            if let Some((nearest, distance_squared)) = nearest_voxel_point(
+                transformed,
+                &index,
+                VOXEL_SIZE,
+                search_radius,
+                max_distance_squared,
+            ) {
+                pairs.push((transformed, nearest, distance_squared));
+            }
+        }
+        if pairs.len() < 80 {
+            break;
+        }
+
+        pairs.sort_unstable_by(|left, right| {
+            left.2
+                .partial_cmp(&right.2)
+                .unwrap_or(Ordering::Equal)
+        });
+        pairs.truncate((pairs.len() * 4 / 5).max(80));
+        let Some(delta) = best_fit_transform(&pairs) else {
+            break;
+        };
+        let translation_step = length3(delta.translation);
+        let rotation_step = rotation_angle(delta.rotation);
+        if translation_step > 0.25 || rotation_step > 35.0_f32.to_radians() {
+            break;
+        }
+        pose = pose.then(delta);
+        if translation_step < 0.000_15 && rotation_step < 0.000_5 {
+            break;
+        }
+    }
+    pose
+}
+
+type VoxelKey = (i32, i32, i32);
+
+fn build_voxel_index(
+    points: &[[f32; 3]],
+    voxel_size: f32,
+) -> HashMap<VoxelKey, Vec<[f32; 3]>> {
+    let mut index = HashMap::<VoxelKey, Vec<[f32; 3]>>::new();
+    for point in points {
+        index
+            .entry(voxel_key(*point, voxel_size))
+            .or_default()
+            .push(*point);
+    }
+    index
+}
+
+fn nearest_voxel_point(
+    point: [f32; 3],
+    index: &HashMap<VoxelKey, Vec<[f32; 3]>>,
+    voxel_size: f32,
+    search_radius: i32,
+    max_distance_squared: f32,
+) -> Option<([f32; 3], f32)> {
+    let (cx, cy, cz) = voxel_key(point, voxel_size);
+    let mut best = None;
+    let mut best_distance_squared = max_distance_squared;
+    for dz in -search_radius..=search_radius {
+        for dy in -search_radius..=search_radius {
+            for dx in -search_radius..=search_radius {
+                let Some(candidates) = index.get(&(cx + dx, cy + dy, cz + dz)) else {
+                    continue;
+                };
+                for candidate in candidates {
+                    let distance_squared = distance_squared3(point, *candidate);
+                    if distance_squared < best_distance_squared {
+                        best_distance_squared = distance_squared;
+                        best = Some((*candidate, distance_squared));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn voxel_key(point: [f32; 3], voxel_size: f32) -> VoxelKey {
+    (
+        (point[0] / voxel_size).floor() as i32,
+        (point[1] / voxel_size).floor() as i32,
+        (point[2] / voxel_size).floor() as i32,
+    )
+}
+
+fn best_fit_transform(
+    pairs: &[([f32; 3], [f32; 3], f32)],
+) -> Option<RigidTransform> {
+    if pairs.len() < 3 {
+        return None;
+    }
+    let count = pairs.len() as f32;
+    let mut source_center = [0.0; 3];
+    let mut target_center = [0.0; 3];
+    for (source, target, _) in pairs {
+        source_center = add3(source_center, *source);
+        target_center = add3(target_center, *target);
+    }
+    source_center = scale3(source_center, count.recip());
+    target_center = scale3(target_center, count.recip());
+
+    let mut covariance = [[0.0_f32; 3]; 3];
+    for (source, target, _) in pairs {
+        let source = sub3(*source, source_center);
+        let target = sub3(*target, target_center);
+        for row in 0..3 {
+            for column in 0..3 {
+                covariance[row][column] += source[row] * target[column];
+            }
+        }
+    }
+    let s = covariance;
+    let trace = s[0][0] + s[1][1] + s[2][2];
+    let horn = [
+        [
+            trace,
+            s[1][2] - s[2][1],
+            s[2][0] - s[0][2],
+            s[0][1] - s[1][0],
+        ],
+        [
+            s[1][2] - s[2][1],
+            s[0][0] - s[1][1] - s[2][2],
+            s[0][1] + s[1][0],
+            s[2][0] + s[0][2],
+        ],
+        [
+            s[2][0] - s[0][2],
+            s[0][1] + s[1][0],
+            -s[0][0] + s[1][1] - s[2][2],
+            s[1][2] + s[2][1],
+        ],
+        [
+            s[0][1] - s[1][0],
+            s[2][0] + s[0][2],
+            s[1][2] + s[2][1],
+            -s[0][0] - s[1][1] + s[2][2],
+        ],
+    ];
+    let quaternion = largest_eigenvector_symmetric(horn);
+    let rotation = quaternion_to_matrix(quaternion);
+    Some(RigidTransform {
+        rotation,
+        translation: sub3(target_center, mat3_vec(rotation, source_center)),
+    })
+}
+
+fn largest_eigenvector_symmetric(mut matrix: [[f32; 4]; 4]) -> [f32; 4] {
+    let mut vectors = [[0.0_f32; 4]; 4];
+    for (index, row) in vectors.iter_mut().enumerate() {
+        row[index] = 1.0;
+    }
+    for _ in 0..32 {
+        let mut pivot = (0usize, 1usize);
+        let mut largest = matrix[0][1].abs();
+        for row in 0..4 {
+            for column in row + 1..4 {
+                if matrix[row][column].abs() > largest {
+                    largest = matrix[row][column].abs();
+                    pivot = (row, column);
+                }
+            }
+        }
+        if largest < 1.0e-7 {
+            break;
+        }
+        let (p, q) = pivot;
+        let theta =
+            0.5 * (2.0 * matrix[p][q]).atan2(matrix[p][p] - matrix[q][q]);
+        let (sin_theta, cos_theta) = theta.sin_cos();
+        let mut jacobi = [[0.0_f32; 4]; 4];
+        for (index, row) in jacobi.iter_mut().enumerate() {
+            row[index] = 1.0;
+        }
+        jacobi[p][p] = cos_theta;
+        jacobi[q][q] = cos_theta;
+        jacobi[p][q] = -sin_theta;
+        jacobi[q][p] = sin_theta;
+        matrix = multiply4(transpose4(jacobi), multiply4(matrix, jacobi));
+        vectors = multiply4(vectors, jacobi);
+    }
+    let eigen_index = (0..4)
+        .max_by(|left, right| {
+            matrix[*left][*left]
+                .partial_cmp(&matrix[*right][*right])
+                .unwrap_or(Ordering::Equal)
+        })
+        .unwrap_or(0);
+    let mut result = [
+        vectors[0][eigen_index],
+        vectors[1][eigen_index],
+        vectors[2][eigen_index],
+        vectors[3][eigen_index],
+    ];
+    let norm = result.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 1.0e-8 {
+        for value in &mut result {
+            *value /= norm;
+        }
+    } else {
+        result = [1.0, 0.0, 0.0, 0.0];
+    }
+    result
+}
+
+fn quaternion_to_matrix([w, x, y, z]: [f32; 4]) -> [[f32; 3]; 3] {
+    [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+}
+
+fn multiply4(left: [[f32; 4]; 4], right: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0_f32; 4]; 4];
+    for (row, values) in result.iter_mut().enumerate() {
+        for (column, value) in values.iter_mut().enumerate() {
+            *value = (0..4)
+                .map(|index| left[row][index] * right[index][column])
+                .sum();
+        }
+    }
+    result
+}
+
+fn transpose4(matrix: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0; 4]; 4];
+    for (row, values) in result.iter_mut().enumerate() {
+        for (column, value) in values.iter_mut().enumerate() {
+            *value = matrix[column][row];
+        }
+    }
+    result
+}
+
+fn mat3_vec(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+    [
+        dot3(matrix[0], vector),
+        dot3(matrix[1], vector),
+        dot3(matrix[2], vector),
+    ]
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+fn add3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
+}
+
+fn sub3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn scale3(vector: [f32; 3], scale: f32) -> [f32; 3] {
+    [vector[0] * scale, vector[1] * scale, vector[2] * scale]
+}
+
+fn length3(vector: [f32; 3]) -> f32 {
+    dot3(vector, vector).sqrt()
+}
+
+fn distance_squared3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    dot3(sub3(left, right), sub3(left, right))
+}
+
+fn rotation_angle(rotation: [[f32; 3]; 3]) -> f32 {
+    let cosine = ((rotation[0][0] + rotation[1][1] + rotation[2][2] - 1.0) * 0.5)
+        .clamp(-1.0, 1.0);
+    cosine.acos()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_frame_mesh(
     intr: Intrinsics,
@@ -903,51 +1377,62 @@ fn add_frame_mesh(
     depth_height: u32,
     depth_z16: &[u16],
     color: Option<&ColorFrame>,
-    angle: f32,
+    camera_to_world: RigidTransform,
     step: usize,
     max_points: usize,
+    frame_point_limit: usize,
     gaussian_radius_m: f32,
+    min_depth_m: f32,
+    max_depth_m: f32,
     vertices: &mut Vec<SplatPoint>,
     faces: &mut Vec<[u32; 3]>,
 ) {
     let width = depth_width as usize;
     let height = depth_height as usize;
-    let grid_w = width.div_ceil(step);
-    let grid_h = height.div_ceil(step);
+    let requested_step = step.max(1);
+    let point_budget = frame_point_limit
+        .max(1)
+        .min(max_points.saturating_sub(vertices.len()));
+    let budget_step = ((width * height).div_ceil(point_budget) as f64)
+        .sqrt()
+        .ceil() as usize;
+    let effective_step = requested_step.max(budget_step.max(1));
+    let grid_w = width.div_ceil(effective_step);
+    let grid_h = height.div_ceil(effective_step);
     let mut index_grid = vec![None::<u32>; grid_w * grid_h];
-    let cos_a = angle.cos();
-    let sin_a = angle.sin();
     let depth_jump = gaussian_radius_m.max(0.006) * 10.0;
+    let frame_vertex_start = vertices.len();
 
     for gy in 0..grid_h {
         for gx in 0..grid_w {
-            if vertices.len() >= max_points {
-                return;
+            if vertices.len() >= max_points
+                || vertices.len().saturating_sub(frame_vertex_start) >= point_budget
+            {
+                break;
             }
-            let x = (gx * step).min(width - 1);
-            let y = (gy * step).min(height - 1);
+            let x = (gx * effective_step).min(width - 1);
+            let y = (gy * effective_step).min(height - 1);
             let raw = depth_z16[y * width + x];
             if raw == 0 {
                 continue;
             }
 
             let z = raw as f32 * depth_units_m;
-            if !(0.02..=8.0).contains(&z) {
+            if !(min_depth_m..=max_depth_m).contains(&z) {
                 continue;
             }
 
             let px = (x as f32 - intr.ppx) / intr.fx * z;
             let py = -((y as f32 - intr.ppy) / intr.fy * z);
             let pz = -z;
-            let rx = px * cos_a - pz * sin_a;
-            let rz = px * sin_a + pz * cos_a;
+            let [world_x, world_y, world_z] = camera_to_world.apply([px, py, pz]);
             let (r, g, b) = sample_rgb(color, x, y, width, height);
 
             let vertex_index = vertices.len() as u32;
             vertices.push(SplatPoint {
-                x: rx,
-                y: py,
-                z: rz,
+                x: world_x,
+                y: world_y,
+                z: world_z,
                 r,
                 g,
                 b,
@@ -1265,7 +1750,10 @@ fn bounds(points: &[SplatPoint]) -> Bounds {
     }
 }
 
-fn write_mcap_training_cache(cache_root: &Path, frames: &[DecodedRgbdFrame]) -> Result<(), String> {
+fn write_mcap_training_cache(
+    cache_root: &Path,
+    frames: &[PositionedRgbdFrame],
+) -> Result<(), String> {
     if frames.is_empty() {
         return Err("MCAP contains no RGB-D frames for MLX training".to_string());
     }
@@ -1281,7 +1769,8 @@ fn write_mcap_training_cache(cache_root: &Path, frames: &[DecodedRgbdFrame]) -> 
             .map_err(|error| format!("failed to create MLX training cache: {error}"))?;
     }
 
-    for (index, frame) in frames.iter().enumerate() {
+    for (index, positioned) in frames.iter().enumerate() {
+        let frame = &positioned.frame;
         let stem = format!("frame_{:06}", index + 1);
         let depth_path = depth_dir.join(format!("{stem}_depth_z16.png"));
         write_depth_png(
@@ -1306,6 +1795,9 @@ fn write_mcap_training_cache(cache_root: &Path, frames: &[DecodedRgbdFrame]) -> 
             "timestampMs": frame.info.timestamp_ms,
             "intrinsics": frame.info.intrinsics,
             "depthUnitsM": frame.info.depth_units_m,
+            "minDepthM": positioned.min_depth_m,
+            "maxDepthM": positioned.max_depth_m,
+            "cameraToWorld": positioned.camera_to_world,
             "files": {
                 "rgb": rgb_path.as_ref().map(|path| path_string(path)),
                 "depth": path_string(&depth_path)
@@ -1966,6 +2458,35 @@ fn io_error(error: std::io::Error) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rigid_alignment_recovers_rotation_and_translation() {
+        let expected = RigidTransform {
+            rotation: RigidTransform::rotation_y(18.0_f32.to_radians()).rotation,
+            translation: [0.045, -0.018, 0.032],
+        };
+        let source = [
+            [-0.18, -0.12, -0.42],
+            [0.16, -0.10, -0.38],
+            [-0.14, 0.15, -0.51],
+            [0.19, 0.11, -0.47],
+            [0.02, -0.03, -0.31],
+            [-0.06, 0.05, -0.62],
+        ];
+        let pairs: Vec<_> = source
+            .into_iter()
+            .map(|point| (point, expected.apply(point), 0.0))
+            .collect();
+        let recovered = best_fit_transform(&pairs).expect("recover rigid transform");
+        for point in source {
+            let actual = recovered.apply(point);
+            let target = expected.apply(point);
+            assert!(
+                distance_squared3(actual, target) < 1.0e-8,
+                "{actual:?} != {target:?}"
+            );
+        }
+    }
 
     #[test]
     fn rgbd_session_builds_every_required_asset_without_external_fbx_tools() {

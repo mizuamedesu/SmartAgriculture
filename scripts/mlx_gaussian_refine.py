@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-size", type=float, default=0.0025)
     parser.add_argument("--iterations", type=int, default=1_600)
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--turntable-degrees", type=float, default=360.0)
+    parser.add_argument("--turntable-degrees", type=float, default=0.0)
     parser.add_argument("--train-size", type=int, default=320)
     parser.add_argument("--max-train-views", type=int, default=12)
     return parser.parse_args()
@@ -244,7 +244,11 @@ def resized_target_intrinsics_and_depth(frame: dict, train_size: int) -> Tuple[n
         depth_src = Image.fromarray(depth_m.astype(np.float32), mode="F")
         depth_src = depth_src.resize((out_w, out_h), Image.Resampling.NEAREST)
         depth_m = np.asarray(depth_src, dtype=np.float32)
-    depth_m = np.where((depth_m >= 0.02) & (depth_m <= 8.0), depth_m, 0.0)[..., None]
+    min_depth_m = float(frame.get("minDepthM", 0.02))
+    max_depth_m = float(frame.get("maxDepthM", 8.0))
+    depth_m = np.where(
+        (depth_m >= min_depth_m) & (depth_m <= max_depth_m), depth_m, 0.0
+    )[..., None]
 
     intr = frame["intrinsics"]
     K = np.array(
@@ -270,6 +274,24 @@ def view_matrix_for_turntable(view_index: int, view_count: int, turntable_degree
     camera_flip = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
     view = np.eye(4, dtype=np.float32)
     view[:3, :3] = camera_flip @ rot_y_inv
+    return view
+
+
+def view_matrix_for_frame(
+    frame: dict, view_index: int, view_count: int, turntable_degrees: float
+) -> np.ndarray:
+    camera_to_world = frame.get("cameraToWorld")
+    if not camera_to_world:
+        return view_matrix_for_turntable(view_index, view_count, turntable_degrees)
+
+    rotation = np.asarray(camera_to_world["rotation"], dtype=np.float32)
+    translation = np.asarray(camera_to_world["translation"], dtype=np.float32)
+    world_to_camera_local = rotation.T
+    local_translation = -(world_to_camera_local @ translation)
+    camera_flip = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+    view = np.eye(4, dtype=np.float32)
+    view[:3, :3] = camera_flip @ world_to_camera_local
+    view[:3, 3] = camera_flip @ local_translation
     return view
 
 
@@ -302,7 +324,9 @@ def load_training_views(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarra
         targets.append(target)
         depth_targets.append(depth_target)
         intrinsics.append(K)
-        viewmats.append(view_matrix_for_turntable(view_index, len(frames), args.turntable_degrees))
+        viewmats.append(
+            view_matrix_for_frame(frame, view_index, len(frames), args.turntable_degrees)
+        )
 
     return (
         np.stack(targets).astype(np.float32),

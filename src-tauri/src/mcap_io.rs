@@ -169,6 +169,18 @@ struct SessionRecord<'a> {
     config: &'a ResolvedCaptureConfig,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredSessionRecord {
+    config: StoredCaptureConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCaptureConfig {
+    min_depth_m: f32,
+    max_depth_m: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RosTime {
     sec: i32,
@@ -706,6 +718,24 @@ pub fn frame_count(path: &Path) -> Result<usize, String> {
         .and_then(|stats| stats.channel_message_counts.get(&depth_channel.id))
         .copied()
         .unwrap_or(0) as usize)
+}
+
+pub fn capture_depth_range(path: &Path) -> Result<(f32, f32), String> {
+    let mapped = map_recording(path)?;
+    let messages =
+        MessageStream::new(&mapped).map_err(|error| format!("failed to open MCAP: {error}"))?;
+    for message in messages {
+        let message = message.map_err(|error| format!("failed to read MCAP message: {error}"))?;
+        if message.channel.topic != TOPIC_SESSION {
+            continue;
+        }
+        let session: StoredSessionRecord = serde_json::from_slice(&message.data)
+            .map_err(|error| format!("failed to decode MCAP session config: {error}"))?;
+        let min_depth_m = session.config.min_depth_m.clamp(0.02, 8.0);
+        let max_depth_m = session.config.max_depth_m.clamp(min_depth_m + 0.01, 8.0);
+        return Ok((min_depth_m, max_depth_m));
+    }
+    Err(format!("MCAP is missing {TOPIC_SESSION} configuration"))
 }
 
 pub fn visit_frame_indices<F>(

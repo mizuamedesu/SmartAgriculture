@@ -26,6 +26,35 @@ use capture::{
 use capture::{CameraBackend, CaptureEvent, ResolvedCaptureConfig};
 use realsense::ensure_realsense_sdk;
 
+pub fn rebuild_scan_assets_cli(session_root: &str) -> Result<String, String> {
+    let result = generate_scan_assets(assets::AssetBuildOptions {
+        session_root: session_root.to_string(),
+        max_points: Some(350_000),
+        frame_stride: Some(1),
+        depth_decimation: Some(2),
+        gaussian_radius_m: Some(0.0035),
+        turntable_degrees: Some(0.0),
+        export_fbx: Some(true),
+        use_mlx: Some(false),
+        mlx_iterations: Some(0),
+        mlx_voxel_size_m: Some(0.0025),
+        mlx_train_size: Some(320),
+        mlx_max_train_views: Some(12),
+        collider_max_faces: Some(35_000),
+    })?;
+    serde_json::to_string_pretty(&result)
+        .map_err(|error| format!("failed to encode asset result: {error}"))
+}
+
+pub fn export_mcap_samples_cli(recording_path: &str, output_root: &str) -> Result<String, String> {
+    let outputs = assets::export_mcap_sample_frames(
+        std::path::Path::new(recording_path),
+        std::path::Path::new(output_root),
+    )?;
+    serde_json::to_string_pretty(&outputs)
+        .map_err(|error| format!("failed to encode sample frame paths: {error}"))
+}
+
 pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("protocol") => {

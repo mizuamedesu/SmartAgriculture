@@ -240,7 +240,7 @@ function App() {
     frameStride: 1,
     depthDecimation: 2,
     gaussianRadiusM: 0.0035,
-    turntableDegrees: 360,
+    turntableDegrees: 0,
     exportFbx: true,
     useMlx: true,
     mlxIterations: 1600,
@@ -1370,7 +1370,7 @@ function AssetCommandPanel(props: {
         <CardContent className="space-y-5 p-5">
           <div className="grid grid-cols-2 gap-3">
             <NumberField
-              label="Max splats"
+              label="Point limit"
               value={props.assetOptions.maxPoints}
               min={5000}
               max={1500000}
@@ -1378,7 +1378,7 @@ function AssetCommandPanel(props: {
               onChange={(value) => updateAsset("maxPoints", value)}
             />
             <NumberField
-              label="Frame step"
+              label="Frame interval"
               value={props.assetOptions.frameStride}
               min={1}
               max={24}
@@ -1629,15 +1629,14 @@ function ControlPanel(props: {
             <WandSparkles className="h-4 w-4 text-muted-foreground" />
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <NumberField label="Frame step" value={props.assetOptions.frameStride} min={1} max={24} onChange={(v) => updateAsset("frameStride", v)} />
-            <NumberField label="Depth step" value={props.assetOptions.depthDecimation} min={1} max={16} onChange={(v) => updateAsset("depthDecimation", v)} />
-            <NumberField label="Max splats" value={props.assetOptions.maxPoints} min={5000} max={1500000} step={1000} onChange={(v) => updateAsset("maxPoints", v)} />
+            <NumberField label="Frame interval" value={props.assetOptions.frameStride} min={1} max={24} onChange={(v) => updateAsset("frameStride", v)} />
+            <NumberField label="Depth sampling" value={props.assetOptions.depthDecimation} min={1} max={16} onChange={(v) => updateAsset("depthDecimation", v)} />
+            <NumberField label="Point limit" value={props.assetOptions.maxPoints} min={5000} max={1500000} step={1000} onChange={(v) => updateAsset("maxPoints", v)} />
             <NumberField label="Radius m" value={props.assetOptions.gaussianRadiusM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("gaussianRadiusM", v)} />
             <NumberField label="MLX iters" value={props.assetOptions.mlxIterations} min={0} max={20000} step={100} onChange={(v) => updateAsset("mlxIterations", v)} />
             <NumberField label="Voxel m" value={props.assetOptions.mlxVoxelSizeM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("mlxVoxelSizeM", v)} />
             <NumberField label="Train px" value={props.assetOptions.mlxTrainSize} min={64} max={1024} step={32} onChange={(v) => updateAsset("mlxTrainSize", v)} />
             <NumberField label="Train views" value={props.assetOptions.mlxMaxTrainViews} min={1} max={64} onChange={(v) => updateAsset("mlxMaxTrainViews", v)} />
-            <NumberField label="Turntable" value={props.assetOptions.turntableDegrees} min={0} max={1080} onChange={(v) => updateAsset("turntableDegrees", v)} />
             <NumberField label="Collider faces" value={props.assetOptions.colliderMaxFaces} min={500} max={120000} step={500} onChange={(v) => updateAsset("colliderMaxFaces", v)} />
             <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
               <input
