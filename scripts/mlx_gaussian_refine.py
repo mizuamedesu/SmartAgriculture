@@ -356,11 +356,15 @@ def train_with_gsplat(
         "opacity_logits": mx.full((n,), logit(0.72), dtype=mx.float32),
         "color_logits": mx.array(np.vectorize(logit)(np.clip(colors_np, 0.001, 0.999)), dtype=mx.float32),
     }
-    targets = mx.array(targets_np, dtype=mx.float32)
-    depth_targets = mx.array(depth_targets_np, dtype=mx.float32)
-    Ks = mx.array(Ks_np, dtype=mx.float32)
-    viewmats = mx.array(viewmats_np, dtype=mx.float32)
-    backgrounds = mx.zeros((view_count, 3), dtype=mx.float32)
+    targets = [mx.array(targets_np[index : index + 1], dtype=mx.float32) for index in range(view_count)]
+    depth_targets = [
+        mx.array(depth_targets_np[index : index + 1], dtype=mx.float32) for index in range(view_count)
+    ]
+    Ks = [mx.array(Ks_np[index : index + 1], dtype=mx.float32) for index in range(view_count)]
+    viewmats = [
+        mx.array(viewmats_np[index : index + 1], dtype=mx.float32) for index in range(view_count)
+    ]
+    background = mx.zeros((1, 3), dtype=mx.float32)
     depth_scale = max(0.02, radius * 24.0)
 
     names = ["means", "log_scales", "quats", "opacity_logits", "color_logits"]
@@ -375,18 +379,28 @@ def train_with_gsplat(
     state: Dict[str, Dict[str, mx.array]] = {}
     final_loss: Optional[float] = None
 
-    def loss_fn(means, log_scales, quats, opacity_logits, color_logits):
+    def loss_fn(
+        means,
+        log_scales,
+        quats,
+        opacity_logits,
+        color_logits,
+        target,
+        depth_target,
+        K,
+        viewmat,
+    ):
         render, alpha, _ = rasterization(
             means=means,
             quats=normalize_quats(quats),
             scales=mx.exp(log_scales),
             opacities=mx.sigmoid(opacity_logits),
             colors=mx.sigmoid(color_logits),
-            viewmats=viewmats,
-            Ks=Ks,
+            viewmats=viewmat,
+            Ks=K,
             width=width,
             height=height,
-            backgrounds=backgrounds,
+            backgrounds=background,
             render_mode="RGB+D",
             sh_degree=None,
             rasterize_mode="antialiased",
@@ -394,12 +408,14 @@ def train_with_gsplat(
         )
         rendered_rgb = render[..., :3]
         rendered_depth = render[..., 3:4]
-        valid_depth = (depth_targets > 0.02).astype(mx.float32)
-        rgb_loss = mx.mean(mx.abs(rendered_rgb - targets))
-        depth_loss = mx.sum(mx.abs(rendered_depth - depth_targets) * valid_depth / depth_scale) / mx.maximum(
+        valid_depth = (depth_target > 0.02).astype(mx.float32)
+        rgb_loss = mx.mean(mx.abs(rendered_rgb - target))
+        depth_loss = mx.sum(mx.abs(rendered_depth - depth_target) * valid_depth / depth_scale) / mx.maximum(
             mx.sum(valid_depth), mx.array(1.0, dtype=mx.float32)
         )
-        coverage_loss = mx.mean((1.0 - alpha) * mx.maximum(mx.mean(targets, axis=-1, keepdims=True), 0.05))
+        coverage_loss = mx.mean(
+            (1.0 - alpha) * mx.maximum(mx.mean(target, axis=-1, keepdims=True), 0.05)
+        )
         scale_reg = mx.mean(mx.square(mx.maximum(mx.exp(log_scales) - radius * 6.0, 0.0) / radius))
         opacity_reg = mx.mean(mx.square(mx.sigmoid(opacity_logits) - 0.72))
         return rgb_loss + 0.18 * depth_loss + 0.08 * coverage_loss + 0.01 * scale_reg + 0.002 * opacity_reg
@@ -407,12 +423,17 @@ def train_with_gsplat(
     t0 = time.time()
     steps = max(0, iterations)
     for step in range(1, steps + 1):
+        view_index = (step - 1) % view_count
         loss, grads_tuple = mx.value_and_grad(loss_fn, argnums=(0, 1, 2, 3, 4))(
             params["means"],
             params["log_scales"],
             params["quats"],
             params["opacity_logits"],
             params["color_logits"],
+            targets[view_index],
+            depth_targets[view_index],
+            Ks[view_index],
+            viewmats[view_index],
         )
         grads = dict(zip(names, grads_tuple))
         adam_update(params, grads, state, lrs, step)

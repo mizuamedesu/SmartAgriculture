@@ -91,6 +91,14 @@ pub fn create_session(
     config: &ResolvedCaptureConfig,
     backend: &str,
 ) -> Result<SessionPaths, String> {
+    create_session_at(&default_output_root()?, config, backend)
+}
+
+pub fn create_session_at(
+    output_root: &Path,
+    config: &ResolvedCaptureConfig,
+    backend: &str,
+) -> Result<SessionPaths, String> {
     let timestamp = Local::now();
     let session_id = format!(
         "{}_{}",
@@ -98,7 +106,7 @@ pub fn create_session(
         sanitize_id(&config.target_label)
     );
 
-    let root = default_output_root()?.join(&session_id);
+    let root = output_root.join(&session_id);
     let rgb_dir = root.join("rgb");
     let depth_dir = root.join("depth_z16");
     let pointcloud_dir = root.join("pointcloud_ply");
@@ -118,6 +126,32 @@ pub fn create_session(
     };
     write_initial_manifest(&paths, config, backend, timestamp)?;
     write_frames_csv_header(&paths)?;
+    Ok(paths)
+}
+
+pub fn open_session(session_id: String, root: PathBuf) -> Result<SessionPaths, String> {
+    let paths = SessionPaths {
+        session_id,
+        rgb_dir: root.join("rgb"),
+        depth_dir: root.join("depth_z16"),
+        pointcloud_dir: root.join("pointcloud_ply"),
+        meta_dir: root.join("metadata"),
+        root,
+    };
+    for dir in [
+        &paths.root,
+        &paths.rgb_dir,
+        &paths.depth_dir,
+        &paths.pointcloud_dir,
+        &paths.meta_dir,
+    ] {
+        if !dir.is_dir() {
+            return Err(format!(
+                "recording session directory is missing: {}",
+                dir.to_string_lossy()
+            ));
+        }
+    }
     Ok(paths)
 }
 
@@ -154,7 +188,7 @@ pub fn write_frame(
     let stats = preview_depth_stats(&frame.depth, config);
     let point_count = write_ply(&ply_path, frame, config)?;
     let summary_paths = FramePaths {
-        rgb: rgb_path.as_ref().map(path_string),
+        rgb: rgb_path.as_ref().map(|path| path_string(path)),
         depth: path_string(&depth_path),
         point_cloud: path_string(&ply_path),
         metadata: path_string(&meta_path),
@@ -605,7 +639,7 @@ fn data_url(mime: &str, data: &[u8]) -> String {
     format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(data))
 }
 
-fn path_string(path: &PathBuf) -> String {
+fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 

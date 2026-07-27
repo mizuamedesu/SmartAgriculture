@@ -96,6 +96,7 @@ interface SessionStarted {
   root: string;
   backend: string;
   notice: string | null;
+  progressPath: string | null;
 }
 
 interface SessionStopped {
@@ -113,6 +114,8 @@ interface PrivilegedPreviewStarted {
 interface InstalledHelper {
   path: string;
   status: string;
+  ready: boolean;
+  current: boolean;
 }
 
 interface DepthStats {
@@ -147,7 +150,8 @@ interface CaptureEvent {
 }
 
 interface AssetTools {
-  blender: string | null;
+  fbxAvailable: boolean;
+  fbxExporter: string;
   python: string | null;
   mlxAvailable: boolean;
   mlxStatus: string;
@@ -162,6 +166,9 @@ interface PreviewPoint {
   g: number;
   b: number;
   radius: number;
+  scale: [number, number, number];
+  rotation: [number, number, number, number];
+  opacity: number;
 }
 
 interface PreviewPayload {
@@ -249,18 +256,26 @@ function App() {
   const [sdkSetupBusy, setSdkSetupBusy] = useState(false);
   const [mlxSetupBusy, setMlxSetupBusy] = useState(false);
   const [helperInstallBusy, setHelperInstallBusy] = useState(false);
+  const [helperStatus, setHelperStatus] = useState<InstalledHelper | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const mockTimer = useRef<number | null>(null);
   const privilegedPollTimer = useRef<number | null>(null);
+  const recordingPollTimer = useRef<number | null>(null);
   const latestFrameAttachTimer = useRef<number | null>(null);
   const previewTimeoutTimer = useRef<number | null>(null);
   const previewRequestId = useRef(0);
   const privilegedReadBusy = useRef(false);
+  const recordingReadBusy = useRef(false);
   const privilegedPreviewRef = useRef<PrivilegedPreviewStarted | null>(null);
   const autoSetupAttempted = useRef(false);
+  const helperBootAttempted = useRef(false);
 
   const devices = probe?.devices ?? [];
   const backend = activeSession?.backend ?? previewSession?.backend ?? config.backend;
+  const helperReady =
+    !isTauri ||
+    config.backend === "synthetic" ||
+    Boolean(helperStatus?.ready && helperStatus.current);
   const busyMessage = captureStopping
     ? "Loading: stopping recording"
     : captureStarting
@@ -272,7 +287,7 @@ function App() {
           : mlxSetupBusy
             ? "Loading: installing MLX 3DGS"
             : helperInstallBusy
-              ? "Loading: installing helper"
+              ? "Loading: preparing RealSense helper"
               : assetBusy
                 ? "Loading: generating 3D assets"
                 : probeBusy
@@ -326,7 +341,7 @@ function App() {
     }
   };
 
-  const setupMlx3dgs = async () => {
+  const setupMlx3dgs = async (): Promise<AssetTools | null> => {
     setMlxSetupBusy(true);
     pushLog("installing MLX 3DGS backend: mlx + gsplat-mlx");
     try {
@@ -334,8 +349,10 @@ function App() {
       setAssetTools(result.tools);
       pushLog(result.status);
       result.log.slice(-3).reverse().forEach((line) => pushLog(firstLine(line)));
+      return result.tools;
     } catch (error) {
       pushLog(`MLX 3DGS setup failed: ${String(error)}`);
+      return null;
     } finally {
       setMlxSetupBusy(false);
     }
@@ -343,16 +360,47 @@ function App() {
 
   const installHelper = async () => {
     setHelperInstallBusy(true);
-    pushLog("installing no-sudo RealSense helper");
+    pushLog("preparing the RealSense helper for this app version");
     try {
-      const result = await tauriCall<InstalledHelper>("install_privileged_helper");
+      const result = await tauriCall<InstalledHelper>("ensure_privileged_helper");
+      setHelperStatus(result);
       pushLog(result.status);
       pushLog(result.path);
+      return result;
     } catch (error) {
       pushLog(`helper install failed: ${String(error)}`);
+      return null;
     } finally {
       setHelperInstallBusy(false);
     }
+  };
+
+  const stopRecordingPolling = () => {
+    if (recordingPollTimer.current !== null) {
+      window.clearInterval(recordingPollTimer.current);
+      recordingPollTimer.current = null;
+    }
+    recordingReadBusy.current = false;
+  };
+
+  const startRecordingPolling = (progressPath: string) => {
+    stopRecordingPolling();
+    recordingPollTimer.current = window.setInterval(async () => {
+      if (recordingReadBusy.current) return;
+      recordingReadBusy.current = true;
+      try {
+        const frame = await tauriCall<FrameSummary>("read_privileged_recording_frame", {
+          progressPath
+        });
+        setLatestFrame((current) =>
+          current?.sessionId === frame.sessionId && current.frameIndex >= frame.frameIndex ? current : frame
+        );
+      } catch {
+        // The event channel is primary; this polling path guarantees live recording preview.
+      } finally {
+        recordingReadBusy.current = false;
+      }
+    }, Math.max(33, Math.round(1000 / Math.max(1, config.fps))));
   };
 
   const startCapture = async () => {
@@ -366,14 +414,19 @@ function App() {
         await setupSdk();
       }
 
+      stopRecordingPolling();
+      setLatestFrame(null);
+      setAssetResult(null);
       const session = await tauriCall<SessionStarted>("start_recording", { config });
       setRecording(true);
       setPreviewing(false);
       setActiveSession(session);
       setPreviewSession(null);
-      setLatestFrame(null);
-      setAssetResult(null);
+      if (session.progressPath) {
+        startRecordingPolling(session.progressPath);
+      }
       pushLog(`started ${session.backend}: ${session.sessionId}`);
+      pushLog("live RGB-D preview follows every recorded frame");
       if (session.notice) pushLog(session.notice);
       if (!isTauri) startMockFrames(session, config, mockTimer, setLatestFrame);
     } catch (error) {
@@ -441,7 +494,8 @@ function App() {
             sessionId: frame.sessionId,
             root: "",
             backend: "realsense",
-            notice: null
+            notice: null,
+            progressPath: null
           }
         );
       } catch {
@@ -501,7 +555,8 @@ function App() {
           sessionId: `browser_preview_${Date.now()}`,
           root: "",
           backend: "synthetic",
-          notice: "Browser preview mode"
+          notice: "Browser preview mode",
+          progressPath: null
         };
         setPreviewSession(session);
         startMockFrames(session, config, mockTimer, setLatestFrame);
@@ -535,7 +590,8 @@ function App() {
         sessionId: started.sessionId,
         root: "",
         backend: "realsense",
-        notice: null
+        notice: null,
+        progressPath: null
       });
       startPrivilegedPolling(started.framePath);
       try {
@@ -595,9 +651,11 @@ function App() {
       stopMockFrames(mockTimer);
       const stopped = await tauriCall<SessionStopped>("stop_recording");
       setRecording(false);
+      stopRecordingPolling();
       pushLog(`stopped ${stopped.framesWritten} frames`);
     } catch (error) {
       setRecording(false);
+      stopRecordingPolling();
       pushLog(`stop failed: ${String(error)}`);
     } finally {
       setCaptureStopping(false);
@@ -612,6 +670,13 @@ function App() {
     setAssetBusy(true);
     pushLog(assetOptions.useMlx ? "building MLX-refined 3DGS, collider, OBJ, and FBX" : "building 3DGS seed, collider, OBJ, and FBX");
     try {
+      if (assetOptions.useMlx && !assetTools?.mlxAvailable) {
+        pushLog("MLX backend is not ready; setting it up before generation");
+        const tools = await setupMlx3dgs();
+        if (!tools?.mlxAvailable) {
+          throw new Error("MLX 3DGS setup did not complete");
+        }
+      }
       const result = await tauriCall<AssetBuildResult>("generate_scan_assets", {
         options: {
           sessionRoot: activeSession.root,
@@ -640,7 +705,30 @@ function App() {
   };
 
   useEffect(() => {
-    refreshProbe({ autoSetup: true });
+    const boot = async () => {
+      if (isTauri && !helperBootAttempted.current) {
+        helperBootAttempted.current = true;
+        setHelperInstallBusy(true);
+        try {
+          const status = await tauriCall<InstalledHelper>("privileged_helper_status");
+          setHelperStatus(status);
+          if (!status.ready || !status.current) {
+            pushLog("one administrator approval prepares RGB-D capture for this app version");
+            const result = await tauriCall<InstalledHelper>("ensure_privileged_helper");
+            setHelperStatus(result);
+            pushLog(result.status);
+          } else {
+            pushLog(status.status);
+          }
+        } catch (error) {
+          pushLog(`startup helper preparation failed: ${String(error)}`);
+        } finally {
+          setHelperInstallBusy(false);
+        }
+      }
+      await refreshProbe({ autoSetup: true });
+    };
+    void boot();
 
     if (!isTauri) return undefined;
     let unlisten: (() => void) | undefined;
@@ -652,6 +740,7 @@ function App() {
         setPreviewLoading(false);
         setLatestFrame(payload.summary);
       } else if (payload.kind === "finished") {
+        stopRecordingPolling();
         setRecording(false);
         setPreviewing(false);
         if (payload.message) pushLog(payload.message);
@@ -667,6 +756,7 @@ function App() {
       clearPreviewTimeout();
       stopMockFrames(mockTimer);
       stopPrivilegedPolling();
+      stopRecordingPolling();
       stopLatestFrameAttach();
       const helper = privilegedPreviewRef.current;
       if (helper && isTauri) {
@@ -751,6 +841,7 @@ function App() {
           stopCapture={stopCapture}
           generateAssets={generateAssets}
           assetTools={assetTools}
+          helperReady={helperReady}
         />
 
         <section className="min-h-0 space-y-4">
@@ -777,6 +868,7 @@ function App() {
           sdkSetupBusy={sdkSetupBusy}
           mlxSetupBusy={mlxSetupBusy}
           helperInstallBusy={helperInstallBusy}
+          helperStatus={helperStatus}
           recording={recording}
           revealSession={() => revealPath(activeSession?.root)}
         />
@@ -805,6 +897,7 @@ function ControlPanel(props: {
   stopCapture: () => void;
   generateAssets: () => void;
   assetTools: AssetTools | null;
+  helperReady: boolean;
 }) {
   const disabled = props.recording || props.previewing || props.captureStarting || props.captureStopping;
   const selectedProfileIndex = CAPTURE_PROFILES.findIndex(
@@ -902,12 +995,15 @@ function ControlPanel(props: {
           <Button
             variant="secondary"
             onClick={props.previewing ? props.stopPreview : props.startPreview}
-            disabled={props.recording || props.captureStarting || props.captureStopping}
+            disabled={props.recording || props.captureStarting || props.captureStopping || !props.helperReady}
           >
             {props.previewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
             {props.previewLoading ? "Loading Preview" : props.previewing ? "Stop Live" : "Live Preview"}
           </Button>
-          <Button onClick={props.startCapture} disabled={props.recording || props.previewing || props.captureStarting}>
+          <Button
+            onClick={props.startCapture}
+            disabled={props.recording || props.previewing || props.captureStarting || !props.helperReady}
+          >
             {props.captureStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanLine className="h-4 w-4" />}
             {props.captureStarting ? "Loading Record" : "Record RGB-D"}
           </Button>
@@ -922,7 +1018,9 @@ function ControlPanel(props: {
             <div>
               <h3 className="text-sm font-semibold">3DGS / FBX</h3>
               <p className="text-xs text-muted-foreground">
-                {props.assetOptions.useMlx ? props.assetTools?.mlxStatus ?? "MLX optional" : props.assetTools?.blender ? "Blender ready" : "FBX optional"}
+                {props.assetOptions.useMlx
+                  ? props.assetTools?.mlxStatus ?? "MLX setup runs automatically"
+                  : props.assetTools?.fbxExporter ?? "Built-in native FBX"}
               </p>
             </div>
             <WandSparkles className="h-4 w-4 text-muted-foreground" />
@@ -1084,6 +1182,7 @@ function OutputPanel(props: {
   sdkSetupBusy: boolean;
   mlxSetupBusy: boolean;
   helperInstallBusy: boolean;
+  helperStatus: InstalledHelper | null;
   recording: boolean;
   revealSession: () => void;
 }) {
@@ -1142,9 +1241,18 @@ function OutputPanel(props: {
             <WandSparkles className={cn("h-4 w-4", props.mlxSetupBusy && "animate-pulse")} />
             {props.mlxSetupBusy ? "Installing 3DGS" : "Setup MLX 3DGS"}
           </Button>
-          <Button className="w-full" variant="outline" onClick={props.installHelper} disabled={props.helperInstallBusy || props.recording}>
+          <Button
+            className="w-full"
+            variant="outline"
+            onClick={props.installHelper}
+            disabled={props.helperInstallBusy || props.recording || Boolean(props.helperStatus?.ready && props.helperStatus.current)}
+          >
             <Cpu className={cn("h-4 w-4", props.helperInstallBusy && "animate-pulse")} />
-            {props.helperInstallBusy ? "Installing helper" : "Install no-sudo helper"}
+            {props.helperInstallBusy
+              ? "Preparing helper"
+              : props.helperStatus?.ready && props.helperStatus.current
+                ? "Capture helper ready"
+                : "Prepare capture helper"}
           </Button>
           {props.devices.length ? (
             props.devices.map((device) => (
@@ -1284,80 +1392,328 @@ function PathRow({ label, value }: { label: string; value: string }) {
 
 function SplatCanvas({ payload }: { payload: PreviewPayload | null }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const angle = useRef(0);
+  const [rendererError, setRendererError] = useState<string | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return undefined;
+    if (!canvas) return undefined;
+    const gl = canvas.getContext("webgl2", {
+      alpha: false,
+      antialias: true,
+      depth: false,
+      premultipliedAlpha: true
+    });
+    if (!gl) {
+      setRendererError("WebGL 2 is unavailable");
+      return undefined;
+    }
+    setRendererError(null);
 
-    let animation = 0;
-    const drawEmpty = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#09090b";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.strokeStyle = "rgba(255,255,255,.12)";
-      ctx.strokeRect(0.5, 0.5, canvas.width - 1, canvas.height - 1);
-      ctx.fillStyle = "rgba(244,244,245,.7)";
-      ctx.font = "15px system-ui";
-      ctx.textAlign = "center";
-      ctx.fillText("3DGS preview appears here", canvas.width / 2, canvas.height / 2);
-    };
-
-    if (!payload?.points.length) {
-      drawEmpty();
+    const program = createSplatProgram(gl);
+    if (!program) {
+      setRendererError("Gaussian shader compilation failed");
       return undefined;
     }
 
-    const points = payload.points;
-    const center = payload.bounds.center;
-    const span = Math.max(
-      payload.bounds.max[0] - payload.bounds.min[0],
-      payload.bounds.max[1] - payload.bounds.min[1],
-      payload.bounds.max[2] - payload.bounds.min[2],
-      0.1
-    );
-    const scale = (Math.min(canvas.width, canvas.height) * 0.82) / span;
+    const vao = gl.createVertexArray();
+    const quadBuffer = gl.createBuffer();
+    const instanceBuffer = gl.createBuffer();
+    if (!vao || !quadBuffer || !instanceBuffer) {
+      setRendererError("GPU buffer allocation failed");
+      return undefined;
+    }
 
-    const draw = () => {
-      angle.current += 0.006;
-      const cos = Math.cos(angle.current);
-      const sin = Math.sin(angle.current);
-      const projected = points.map((point) => {
-        const x = point.x - center[0];
-        const y = point.y - center[1];
-        const z = point.z - center[2];
-        const rx = x * cos - z * sin;
-        const rz = x * sin + z * cos;
-        const perspective = 1.5 / (1.5 - rz);
-        return {
-          x: canvas.width / 2 + rx * scale * perspective,
-          y: canvas.height / 2 - y * scale * perspective,
-          z: rz,
-          size: Math.max(1.1, point.radius * scale * perspective * 1.8),
-          color: `rgb(${point.r},${point.g},${point.b})`
-        };
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+      gl.STATIC_DRAW
+    );
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    const stride = 8 * Float32Array.BYTES_PER_ELEMENT;
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+    for (const [location, size, offset] of [
+      [1, 3, 0],
+      [2, 4, 3],
+      [3, 1, 7]
+    ] as const) {
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(location, size, gl.FLOAT, false, stride, offset * Float32Array.BYTES_PER_ELEMENT);
+      gl.vertexAttribDivisor(location, 1);
+    }
+    gl.bindVertexArray(null);
+
+    const points = payload?.points ?? [];
+    const center = payload?.bounds.center ?? [0, 0, 0];
+    const span = payload
+      ? Math.max(
+          payload.bounds.max[0] - payload.bounds.min[0],
+          payload.bounds.max[1] - payload.bounds.min[1],
+          payload.bounds.max[2] - payload.bounds.min[2],
+          0.1
+        )
+      : 1;
+    const packed = new Float32Array(points.length * 8);
+    points.forEach((point, index) => {
+      const offset = index * 8;
+      packed[offset] = point.x - center[0];
+      packed[offset + 1] = point.y - center[1];
+      packed[offset + 2] = point.z - center[2];
+      packed[offset + 3] = point.r / 255;
+      packed[offset + 4] = point.g / 255;
+      packed[offset + 5] = point.b / 255;
+      packed[offset + 6] = Math.min(1, Math.max(0.02, point.opacity ?? 0.85));
+      packed[offset + 7] = Math.max(point.radius, ...(point.scale ?? [point.radius, point.radius, point.radius]));
+    });
+    const order = Array.from({ length: points.length }, (_, index) => index);
+    const sorted = new Float32Array(packed.length);
+
+    const projectionLocation = gl.getUniformLocation(program, "u_projection");
+    const viewportLocation = gl.getUniformLocation(program, "u_viewport");
+    const rotationLocation = gl.getUniformLocation(program, "u_rotation");
+    const distanceLocation = gl.getUniformLocation(program, "u_distance");
+    let yaw = 0.35;
+    let pitch = -0.12;
+    let distance = span * 2.7;
+    let dragging = false;
+    let previousX = 0;
+    let previousY = 0;
+    let animation = 0;
+    let previousTime = performance.now();
+    let sortFrame = 0;
+
+    const uploadSortedPoints = () => {
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const cosPitch = Math.cos(pitch);
+      const sinPitch = Math.sin(pitch);
+      const depth = (index: number) => {
+        const offset = index * 8;
+        const x = packed[offset];
+        const y = packed[offset + 1];
+        const z = packed[offset + 2];
+        const yawZ = x * sinYaw + z * cosYaw;
+        return y * sinPitch + yawZ * cosPitch;
+      };
+      order.sort((a, b) => depth(a) - depth(b));
+      order.forEach((sourceIndex, targetIndex) => {
+        sorted.set(packed.subarray(sourceIndex * 8, sourceIndex * 8 + 8), targetIndex * 8);
       });
-      projected.sort((a, b) => a.z - b.z);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#09090b";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      for (const point of projected) {
-        ctx.globalAlpha = 0.72;
-        ctx.fillStyle = point.color;
-        ctx.beginPath();
-        ctx.arc(point.x, point.y, point.size, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-      animation = requestAnimationFrame(draw);
+      gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, sorted, gl.DYNAMIC_DRAW);
     };
 
-    draw();
-    return () => cancelAnimationFrame(animation);
+    const resize = () => {
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+    };
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(canvas);
+    resize();
+    uploadSortedPoints();
+
+    const onPointerDown = (event: PointerEvent) => {
+      dragging = true;
+      previousX = event.clientX;
+      previousY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (!dragging) return;
+      yaw += (event.clientX - previousX) * 0.008;
+      pitch = Math.max(-1.35, Math.min(1.35, pitch + (event.clientY - previousY) * 0.008));
+      previousX = event.clientX;
+      previousY = event.clientY;
+      uploadSortedPoints();
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      dragging = false;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    };
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      distance = Math.max(span * 0.75, Math.min(span * 8, distance * Math.exp(event.deltaY * 0.001)));
+    };
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+
+    gl.useProgram(program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.CULL_FACE);
+
+    const draw = (time: number) => {
+      const delta = Math.min(0.05, (time - previousTime) / 1000);
+      previousTime = time;
+      if (!dragging && points.length) {
+        yaw += delta * 0.16;
+        sortFrame += 1;
+        if (sortFrame % 4 === 0) uploadSortedPoints();
+      }
+      resize();
+      gl.clearColor(0.035, 0.035, 0.043, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      if (points.length) {
+        const aspect = canvas.width / Math.max(1, canvas.height);
+        gl.uniformMatrix4fv(projectionLocation, false, perspectiveMatrix(Math.PI / 4, aspect, span * 0.02, span * 20));
+        gl.uniform2f(viewportLocation, canvas.width, canvas.height);
+        gl.uniform2f(rotationLocation, yaw, pitch);
+        gl.uniform1f(distanceLocation, distance);
+        gl.bindVertexArray(vao);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, points.length);
+        gl.bindVertexArray(null);
+      }
+      animation = requestAnimationFrame(draw);
+    };
+    animation = requestAnimationFrame(draw);
+
+    return () => {
+      cancelAnimationFrame(animation);
+      resizeObserver.disconnect();
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerUp);
+      canvas.removeEventListener("wheel", onWheel);
+      gl.deleteBuffer(instanceBuffer);
+      gl.deleteBuffer(quadBuffer);
+      gl.deleteVertexArray(vao);
+      gl.deleteProgram(program);
+    };
   }, [payload]);
 
-  return <canvas ref={canvasRef} width={1000} height={430} className="h-[430px] w-full rounded-lg border bg-zinc-950" />;
+  return (
+    <div className="relative">
+      <canvas
+        ref={canvasRef}
+        width={1000}
+        height={430}
+        className="h-[430px] w-full touch-none rounded-lg border bg-zinc-950 cursor-grab active:cursor-grabbing"
+      />
+      <div className="pointer-events-none absolute bottom-3 left-3 rounded bg-black/55 px-2 py-1 text-[11px] text-zinc-300">
+        {rendererError ?? (payload?.points.length ? "GPU Gaussian preview · drag to rotate · scroll to zoom" : "3DGS preview appears here")}
+      </div>
+    </div>
+  );
+}
+
+function createSplatProgram(gl: WebGL2RenderingContext) {
+  const vertexSource = `#version 300 es
+    precision highp float;
+    layout(location = 0) in vec2 a_corner;
+    layout(location = 1) in vec3 a_center;
+    layout(location = 2) in vec4 a_color;
+    layout(location = 3) in float a_radius;
+    uniform mat4 u_projection;
+    uniform vec2 u_viewport;
+    uniform vec2 u_rotation;
+    uniform float u_distance;
+    out vec2 v_uv;
+    out vec4 v_color;
+
+    void main() {
+      float cy = cos(u_rotation.x);
+      float sy = sin(u_rotation.x);
+      float cp = cos(u_rotation.y);
+      float sp = sin(u_rotation.y);
+      vec3 yawed = vec3(
+        a_center.x * cy - a_center.z * sy,
+        a_center.y,
+        a_center.x * sy + a_center.z * cy
+      );
+      vec3 view = vec3(
+        yawed.x,
+        yawed.y * cp - yawed.z * sp,
+        yawed.y * sp + yawed.z * cp - u_distance
+      );
+      vec4 clip = u_projection * vec4(view, 1.0);
+      float radius_px = clamp(
+        a_radius * 3.0 * u_projection[1][1] * u_viewport.y * 0.5 / max(0.001, -view.z),
+        1.2,
+        96.0
+      );
+      vec2 clip_offset = a_corner * radius_px * 2.0 / u_viewport * clip.w;
+      gl_Position = clip + vec4(clip_offset, 0.0, 0.0);
+      v_uv = a_corner;
+      v_color = a_color;
+    }`;
+  const fragmentSource = `#version 300 es
+    precision highp float;
+    in vec2 v_uv;
+    in vec4 v_color;
+    out vec4 out_color;
+
+    void main() {
+      float radius2 = dot(v_uv, v_uv);
+      if (radius2 > 1.0) discard;
+      float alpha = exp(-4.5 * radius2) * v_color.a;
+      if (alpha < 0.004) discard;
+      out_color = vec4(v_color.rgb * alpha, alpha);
+    }`;
+  const vertex = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
+  const fragment = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+  if (!vertex || !fragment) return null;
+  const program = gl.createProgram();
+  if (!program) return null;
+  gl.attachShader(program, vertex);
+  gl.attachShader(program, fragment);
+  gl.linkProgram(program);
+  gl.deleteShader(vertex);
+  gl.deleteShader(fragment);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return null;
+  }
+  return program;
+}
+
+function compileShader(gl: WebGL2RenderingContext, type: number, source: string) {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
+}
+
+function perspectiveMatrix(fov: number, aspect: number, near: number, far: number) {
+  const f = 1 / Math.tan(fov / 2);
+  const range = 1 / (near - far);
+  return new Float32Array([
+    f / aspect,
+    0,
+    0,
+    0,
+    0,
+    f,
+    0,
+    0,
+    0,
+    0,
+    (far + near) * range,
+    -1,
+    0,
+    0,
+    2 * far * near * range,
+    0
+  ]);
 }
 
 async function tauriCall<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -1380,7 +1736,14 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     } as T;
   }
   if (command === "detect_asset_tools") {
-    return { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" } as T;
+    return {
+      fbxAvailable: true,
+      fbxExporter: "Built-in native FBX 7.4 exporter",
+      python: "/preview/python3",
+      mlxAvailable: false,
+      mlxStatus: "Preview mode",
+      brushHint: "Preview mode"
+    } as T;
   }
   if (command === "ensure_realsense_sdk") {
     return {
@@ -1392,13 +1755,26 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     return {
       status: "Preview mode: gsplat-mlx setup runs only inside Tauri",
       log: ["Preview mode"],
-      tools: { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" }
+      tools: {
+        fbxAvailable: true,
+        fbxExporter: "Built-in native FBX 7.4 exporter",
+        python: "/preview/python3",
+        mlxAvailable: true,
+        mlxStatus: "Preview MLX ready",
+        brushHint: "Preview mode"
+      }
     } as T;
   }
-  if (command === "install_privileged_helper") {
+  if (
+    command === "install_privileged_helper" ||
+    command === "ensure_privileged_helper" ||
+    command === "privileged_helper_status"
+  ) {
     return {
       path: "/preview/realsense-helper",
-      status: "Preview mode: helper install runs only inside Tauri"
+      status: "Preview mode: helper install runs only inside Tauri",
+      ready: true,
+      current: true
     } as T;
   }
   if (command === "start_recording" || command === "start_preview") {
@@ -1406,7 +1782,8 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       sessionId: `preview_${Date.now()}`,
       root: "/preview/SmartAgricultureScans",
       backend: "synthetic",
-      notice: "Browser preview mode"
+      notice: "Browser preview mode",
+      progressPath: null
     } as T;
   }
   if (command === "stop_recording" || command === "stop_preview") {
@@ -1432,18 +1809,25 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       gaussianPly: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.ply",
       splat: "/preview/assets/gaussian_splats/tomato_gaussians_mlx.splat",
       meshObj: "/preview/assets/mesh/tomato_surface.obj",
-      meshFbx: null,
+      meshFbx: "/preview/assets/mesh/tomato_surface.fbx",
       colliderObj: "/preview/assets/mesh/tomato_collider.obj",
       collisionJson: "/preview/assets/mesh/tomato_collision.json",
-      collisionFbx: null,
+      collisionFbx: "/preview/assets/mesh/tomato_surface.fbx",
       previewJson: "/preview/assets/preview/preview_points.json",
       manifest: "/preview/assets/asset_manifest.json",
       pointCount: points.length,
       faceCount: 12000,
-      fbxStatus: "Preview mode",
+      fbxStatus: "Native FBX ready (no Blender)",
       mlxStatus: "Preview mode",
       collisionStatus: "Preview collision collider ready",
-      tools: { blender: null, python: "/preview/python3", mlxAvailable: false, mlxStatus: "Preview mode", brushHint: "Preview mode" },
+      tools: {
+        fbxAvailable: true,
+        fbxExporter: "Built-in native FBX 7.4 exporter",
+        python: "/preview/python3",
+        mlxAvailable: false,
+        mlxStatus: "Preview mode",
+        brushHint: "Preview mode"
+      },
       preview: {
         points,
         bounds: {
@@ -1556,7 +1940,10 @@ function mockPreviewPoints() {
       r: 190 + Math.floor(Math.random() * 48),
       g: 48 + Math.floor(Math.random() * 35),
       b: 38 + Math.floor(Math.random() * 30),
-      radius: 0.006
+      radius: 0.006,
+      scale: [0.006, 0.006, 0.006],
+      rotation: [1, 0, 0, 0],
+      opacity: 0.85
     });
   }
   return points;

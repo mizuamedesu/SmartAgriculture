@@ -10,7 +10,10 @@ use std::{
 use png::{BitDepth, ColorType, Decoder};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::Intrinsics;
+use crate::{
+    capture::Intrinsics,
+    fbx::{FbxMesh, FbxVertex, write_fbx},
+};
 
 const SH_C0: f32 = 0.282_094_8;
 const MLX_REFINE_SCRIPT: &str = include_str!("../../scripts/mlx_gaussian_refine.py");
@@ -36,7 +39,8 @@ pub struct AssetBuildOptions {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetTools {
-    pub blender: Option<String>,
+    pub fbx_available: bool,
+    pub fbx_exporter: String,
     pub python: Option<String>,
     pub mlx_available: bool,
     pub mlx_status: String,
@@ -109,6 +113,7 @@ struct AssetManifest<'a> {
     collision_json: &'a str,
     collision_fbx: Option<&'a str>,
     preview_json: &'a str,
+    fbx_status: &'a str,
     mlx_status: &'a str,
     collision_status: &'a str,
     options: AssetOptionsSummary,
@@ -147,6 +152,9 @@ pub struct PreviewPoint {
     pub g: u8,
     pub b: u8,
     pub radius: f32,
+    pub scale: [f32; 3],
+    pub rotation: [f32; 4],
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,11 +223,12 @@ pub fn detect_asset_tools() -> AssetTools {
         ),
     };
     AssetTools {
-        blender: find_blender().map(|path| path.to_string_lossy().to_string()),
+        fbx_available: true,
+        fbx_exporter: "Built-in native FBX 7.4 exporter".to_string(),
         python,
         mlx_available,
         mlx_status,
-        brush_hint: "gsplat-mlx is the active Apple Silicon 3DGS backend; it uses MLX autograd and differentiable rasterization instead of CUDA kernels.".to_string(),
+        brush_hint: "FBX is exported natively with no Blender dependency. gsplat-mlx remains the Apple Silicon 3DGS training backend.".to_string(),
     }
 }
 
@@ -324,7 +333,11 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     let selected: Vec<_> = frames
         .into_iter()
         .enumerate()
-        .filter_map(|(index, frame)| (index as u32 % frame_stride == 0).then_some(frame))
+        .filter_map(|(index, frame)| {
+            (index as u32)
+                .is_multiple_of(frame_stride)
+                .then_some(frame)
+        })
         .collect();
     if selected.is_empty() {
         return Err("no frames selected for asset generation".to_string());
@@ -364,7 +377,6 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     let mesh_fbx = mesh_dir.join("tomato_surface.fbx");
     let collider_obj = mesh_dir.join("tomato_collider.obj");
     let collision_json = mesh_dir.join("tomato_collision.json");
-    let blender_script = mesh_dir.join("obj_to_fbx.py");
     let preview_json = preview_dir.join("preview_points.json");
     let manifest = asset_root.join("asset_manifest.json");
 
@@ -384,14 +396,10 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
     let mut final_points = mesh.vertices.clone();
     let mut final_gaussian_ply = seed_gaussian_ply.clone();
     let mut final_splat = seed_splat.clone();
-    let mut mlx_status = if use_mlx {
-        "MLX refinement requested".to_string()
-    } else {
-        "MLX refinement disabled".to_string()
-    };
+    let mut mlx_status = "RGB-D Gaussian seed (MLX refinement disabled)".to_string();
 
     if use_mlx {
-        match run_mlx_refinement(
+        let refinement = run_mlx_refinement(
             &session_root,
             &seed_gaussian_ply,
             &mlx_gaussian_ply,
@@ -404,41 +412,38 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
             turntable_degrees,
             mlx_train_size,
             mlx_max_train_views,
-        ) {
-            Ok(refinement) => {
-                final_points = refinement.points;
-                final_gaussian_ply = refinement.ply_path;
-                final_splat = mlx_splat;
-                write_splat(&final_splat, &final_points)?;
-                mlx_status = refinement.status;
-            }
-            Err(error) => {
-                mlx_status = format!("MLX refinement skipped: {error}");
-            }
-        }
+        )
+        .map_err(|error| {
+            format!(
+                "MLX 3DGS refinement was requested but failed; no fallback was reported as success: {error}"
+            )
+        })?;
+        final_points = refinement.points;
+        final_gaussian_ply = refinement.ply_path;
+        final_splat = mlx_splat;
+        write_splat(&final_splat, &final_points)?;
+        mlx_status = refinement.status;
     }
 
     let preview = build_preview_payload(&final_points);
     write_preview_json(&preview_json, &preview)?;
 
-    let tools = detect_asset_tools();
     let fbx_status = if export_fbx {
-        match export_fbx_with_blender(
-            &mesh_obj,
-            &collider_obj,
+        export_fbx_native(
             &mesh_fbx,
-            &blender_script,
-            tools.blender.as_deref(),
-        ) {
-            Ok(status) => status,
-            Err(error) => format!("FBX skipped: {error}"),
-        }
+            &mesh,
+            &collider_mesh,
+        )?
     } else {
         "FBX export disabled".to_string()
     };
 
+    let tools = detect_asset_tools();
     let mesh_fbx_output = mesh_fbx.exists().then(|| path_string(&mesh_fbx));
     let collision_fbx_output = mesh_fbx.exists().then(|| path_string(&mesh_fbx));
+    if export_fbx && mesh_fbx_output.is_none() {
+        return Err("native FBX export completed without an output file".to_string());
+    }
     let seed_gaussian_ply_string = path_string(&seed_gaussian_ply);
     let gaussian_ply_string = path_string(&final_gaussian_ply);
     let splat_string = path_string(&final_splat);
@@ -463,6 +468,7 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
         collision_json: &collision_json_string,
         collision_fbx: collision_fbx_output.as_deref(),
         preview_json: &preview_json_string,
+        fbx_status: &fbx_status,
         mlx_status: &mlx_status,
         collision_status: &collision_status,
         options: AssetOptionsSummary {
@@ -651,15 +657,15 @@ fn add_frame_mesh(
             let b = index_grid[gy * grid_w + gx + 1];
             let c = index_grid[(gy + 1) * grid_w + gx];
             let d = index_grid[(gy + 1) * grid_w + gx + 1];
-            if let (Some(a), Some(b), Some(c)) = (a, b, c) {
-                if face_is_local(vertices, [a, b, c], depth_jump) {
-                    faces.push([a + 1, b + 1, c + 1]);
-                }
+            if let (Some(a), Some(b), Some(c)) = (a, b, c)
+                && face_is_local(vertices, [a, b, c], depth_jump)
+            {
+                faces.push([a + 1, b + 1, c + 1]);
             }
-            if let (Some(b), Some(d), Some(c)) = (b, d, c) {
-                if face_is_local(vertices, [b, d, c], depth_jump) {
-                    faces.push([b + 1, d + 1, c + 1]);
-                }
+            if let (Some(b), Some(d), Some(c)) = (b, d, c)
+                && face_is_local(vertices, [b, d, c], depth_jump)
+            {
+                faces.push([b + 1, d + 1, c + 1]);
             }
         }
     }
@@ -908,6 +914,9 @@ fn build_preview_payload(points: &[SplatPoint]) -> PreviewPayload {
                 g: point.g,
                 b: point.b,
                 radius: point.radius,
+                scale: point.scale,
+                rotation: point.rotation,
+                opacity: 1.0 / (1.0 + (-point.opacity_logit).exp()),
             })
             .collect(),
     }
@@ -947,6 +956,7 @@ fn bounds(points: &[SplatPoint]) -> Bounds {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mlx_refinement(
     session_root: &Path,
     seed_ply: &Path,
@@ -1199,109 +1209,68 @@ fn read_scale(values: &[f32], scale_idx: Option<usize>) -> f32 {
         .unwrap_or(0.006)
 }
 
-fn export_fbx_with_blender(
-    obj_path: &Path,
-    collider_obj_path: &Path,
+fn export_fbx_native(
     fbx_path: &Path,
-    script_path: &Path,
-    blender_path: Option<&str>,
+    visual_mesh: &MeshBuild,
+    collider_mesh: &MeshBuild,
 ) -> Result<String, String> {
-    let blender = blender_path.ok_or_else(|| {
-        "Blender was not found. Install Apple Silicon Blender, then rerun asset generation."
-            .to_string()
-    })?;
-    fs::write(script_path, blender_script())
-        .map_err(|error| format!("failed to write Blender script: {error}"))?;
+    let visual_vertices = fbx_vertices(visual_mesh);
+    let collider_vertices = fbx_vertices(collider_mesh);
+    let visual_triangles = fbx_triangles(visual_mesh)?;
+    let collider_triangles = fbx_triangles(collider_mesh)?;
 
-    let output = Command::new(blender)
-        .arg("--background")
-        .arg("--python")
-        .arg(script_path)
-        .arg("--")
-        .arg(obj_path)
-        .arg(collider_obj_path)
-        .arg(fbx_path)
-        .output()
-        .map_err(|error| format!("failed to run Blender: {error}"))?;
+    write_fbx(
+        fbx_path,
+        FbxMesh {
+            name: "tomato_surface",
+            vertices: &visual_vertices,
+            triangles: &visual_triangles,
+        },
+        FbxMesh {
+            name: "UCX_tomato_surface_00",
+            vertices: &collider_vertices,
+            triangles: &collider_triangles,
+        },
+    )?;
 
-    if output.status.success() && fbx_path.exists() {
-        Ok("FBX exported with Blender (visual mesh + UCX collider)".to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(format!("Blender export failed: {stderr}{stdout}"))
-    }
+    let bytes = fs::metadata(fbx_path)
+        .map_err(|error| format!("failed to stat native FBX: {error}"))?
+        .len();
+    Ok(format!(
+        "Native FBX ready: visual mesh + UCX collider, {:.1} MiB (no Blender)",
+        bytes as f64 / (1024.0 * 1024.0)
+    ))
 }
 
-fn blender_script() -> &'static str {
-    r#"
-import sys
-import bpy
-
-argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[-3:]
-obj_path = argv[0]
-collider_obj_path = argv[1]
-fbx_path = argv[2]
-
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete()
-
-def import_obj(path):
-    before = set(bpy.context.scene.objects)
-    if hasattr(bpy.ops.wm, "obj_import"):
-        bpy.ops.wm.obj_import(filepath=path)
-    else:
-        bpy.ops.import_scene.obj(filepath=path)
-    after = [obj for obj in bpy.context.scene.objects if obj not in before]
-    return after
-
-visual_objects = import_obj(obj_path)
-for obj in visual_objects:
-    obj.name = "tomato_surface"
-    obj.data.name = "tomato_surface_mesh"
-    obj.select_set(True)
-    if obj.type == 'MESH':
-        bpy.context.view_layer.objects.active = obj
-        if len(obj.data.polygons) == 0:
-            continue
-        obj.data.update()
-
-collider_objects = import_obj(collider_obj_path)
-for obj in collider_objects:
-    obj.name = "UCX_tomato_surface_00"
-    obj.data.name = "UCX_tomato_surface_00_mesh"
-    obj["collision"] = "triangle_mesh"
-    obj.display_type = "WIRE"
-    obj.hide_render = True
-    obj.select_set(True)
-    if obj.type == 'MESH':
-        bpy.context.view_layer.objects.active = obj
-        obj.data.update()
-
-bpy.ops.export_scene.fbx(
-    filepath=fbx_path,
-    use_selection=False,
-    apply_unit_scale=True,
-    bake_space_transform=False,
-    axis_forward='-Z',
-    axis_up='Y',
-)
-"#
+fn fbx_vertices(mesh: &MeshBuild) -> Vec<FbxVertex> {
+    mesh.vertices
+        .iter()
+        .map(|vertex| FbxVertex {
+            position: [vertex.x as f64, vertex.y as f64, vertex.z as f64],
+            color: [
+                vertex.r as f64 / 255.0,
+                vertex.g as f64 / 255.0,
+                vertex.b as f64 / 255.0,
+                1.0,
+            ],
+        })
+        .collect()
 }
 
-fn find_blender() -> Option<PathBuf> {
-    let candidates = [
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "/opt/homebrew/bin/blender",
-        "/usr/local/bin/blender",
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    find_in_path("blender")
+fn fbx_triangles(mesh: &MeshBuild) -> Result<Vec<[u32; 3]>, String> {
+    mesh.faces
+        .iter()
+        .enumerate()
+        .map(|(face_index, face)| {
+            let mut converted = [0u32; 3];
+            for (slot, index) in face.iter().enumerate() {
+                converted[slot] = index.checked_sub(1).ok_or_else(|| {
+                    format!("mesh face {face_index} contains an invalid zero vertex index")
+                })?;
+            }
+            Ok(converted)
+        })
+        .collect()
 }
 
 fn find_python() -> Option<String> {
@@ -1314,6 +1283,14 @@ fn find_python() -> Option<String> {
 
 fn find_system_python() -> Option<String> {
     for candidate in [
+        "/opt/homebrew/bin/python3.12",
+        "/usr/local/bin/python3.12",
+        "/opt/homebrew/bin/python3.13",
+        "/usr/local/bin/python3.13",
+        "/opt/homebrew/bin/python3.11",
+        "/usr/local/bin/python3.11",
+        "/opt/homebrew/bin/python3.10",
+        "/usr/local/bin/python3.10",
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3",
         "/usr/bin/python3",
@@ -1557,4 +1534,144 @@ fn path_string(path: &Path) -> String {
 
 fn io_error(error: std::io::Error) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rgbd_session_builds_every_required_asset_without_external_fbx_tools() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let session_root = std::env::temp_dir().join(format!(
+            "tomato-twin-assets-{}-{stamp}",
+            std::process::id()
+        ));
+        let rgb_dir = session_root.join("rgb");
+        let depth_dir = session_root.join("depth_z16");
+        let metadata_dir = session_root.join("metadata");
+        for dir in [&rgb_dir, &depth_dir, &metadata_dir] {
+            fs::create_dir_all(dir).expect("create test session directory");
+        }
+
+        let rgb_path = rgb_dir.join("frame_000001_rgb.png");
+        let depth_path = depth_dir.join("frame_000001_depth_z16.png");
+        write_test_rgb_png(&rgb_path, 24, 24);
+        write_test_depth_png(&depth_path, 24, 24);
+        let metadata_path = metadata_dir.join("frame_000001.json");
+        let metadata = serde_json::json!({
+            "sessionId": "native_fbx_test",
+            "frameIndex": 1,
+            "frameNumber": 1,
+            "timestampMs": 0.0,
+            "intrinsics": {
+                "width": 24,
+                "height": 24,
+                "ppx": 11.5,
+                "ppy": 11.5,
+                "fx": 120.0,
+                "fy": 120.0,
+                "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0]
+            },
+            "depthUnitsM": 0.001,
+            "files": {
+                "rgb": path_string(&rgb_path),
+                "depth": path_string(&depth_path)
+            }
+        });
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let result = generate_scan_assets(AssetBuildOptions {
+            session_root: path_string(&session_root),
+            max_points: Some(5_000),
+            frame_stride: Some(1),
+            depth_decimation: Some(1),
+            gaussian_radius_m: Some(0.006),
+            turntable_degrees: Some(0.0),
+            export_fbx: Some(true),
+            use_mlx: Some(false),
+            mlx_iterations: Some(0),
+            mlx_voxel_size_m: Some(0.003),
+            mlx_train_size: Some(64),
+            mlx_max_train_views: Some(1),
+            collider_max_faces: Some(500),
+        })
+        .expect("generate complete RGB-D asset set");
+
+        let required = [
+            &result.seed_gaussian_ply,
+            &result.gaussian_ply,
+            &result.splat,
+            &result.mesh_obj,
+            result.mesh_fbx.as_ref().expect("native FBX path"),
+            &result.collider_obj,
+            &result.collision_json,
+            &result.preview_json,
+            &result.manifest,
+        ];
+        for path in required {
+            let metadata = fs::metadata(path).unwrap_or_else(|error| {
+                panic!("required output {path} is missing: {error}");
+            });
+            assert!(metadata.len() > 0, "required output {path} is empty");
+        }
+        assert!(result.point_count >= 500);
+        assert!(result.face_count > 0);
+        assert!(result.fbx_status.contains("Native FBX ready"));
+        assert!(result.mlx_status.contains("RGB-D Gaussian seed"));
+        assert!(result.tools.fbx_available);
+        assert_eq!(
+            result.mesh_fbx.as_deref(),
+            result.collision_fbx.as_deref(),
+            "visual mesh and UCX collider share one import-ready FBX"
+        );
+
+        let manifest = fs::read_to_string(&result.manifest).expect("read asset manifest");
+        assert!(manifest.contains("\"fbxStatus\""));
+        assert!(manifest.contains("\"meshFbx\""));
+        let _ = fs::remove_dir_all(&session_root);
+    }
+
+    fn write_test_rgb_png(path: &Path, width: u32, height: u32) {
+        let file = File::create(path).expect("create RGB PNG");
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(ColorType::Rgb);
+        encoder.set_depth(BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("write RGB PNG header");
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgb.extend_from_slice(&[
+                    180 + (x % 40) as u8,
+                    35 + (y % 50) as u8,
+                    28,
+                ]);
+            }
+        }
+        writer.write_image_data(&rgb).expect("write RGB PNG");
+    }
+
+    fn write_test_depth_png(path: &Path, width: u32, height: u32) {
+        let file = File::create(path).expect("create depth PNG");
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(ColorType::Grayscale);
+        encoder.set_depth(BitDepth::Sixteen);
+        let mut writer = encoder.write_header().expect("write depth PNG header");
+        let mut depth = Vec::with_capacity((width * height * 2) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let millimeters = 420u16 + ((x + y) % 8) as u16;
+                depth.extend_from_slice(&millimeters.to_be_bytes());
+            }
+        }
+        writer.write_image_data(&depth).expect("write depth PNG");
+    }
 }

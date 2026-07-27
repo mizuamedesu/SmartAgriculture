@@ -1,5 +1,6 @@
 mod assets;
 mod capture;
+mod fbx;
 mod realsense;
 mod storage;
 
@@ -11,37 +12,47 @@ use std::{
 };
 
 use assets::{detect_asset_tools, ensure_mlx_3dgs, generate_scan_assets};
-use capture::{CameraBackend, ResolvedCaptureConfig};
+use capture::{CameraBackend, CaptureEvent, ResolvedCaptureConfig};
 use capture::{
-    AppState, install_privileged_helper, list_devices, probe_runtime,
-    read_latest_privileged_preview_frame, read_privileged_preview_frame, reveal_path,
-    start_preview, start_privileged_preview, start_recording, stop_preview,
-    stop_privileged_preview, stop_recording,
+    AppState, ensure_privileged_helper, install_privileged_helper, list_devices,
+    privileged_helper_status, probe_runtime, read_latest_privileged_preview_frame,
+    read_privileged_preview_frame, read_privileged_recording_frame, reveal_path, start_preview,
+    start_privileged_preview, start_recording, stop_preview, stop_privileged_preview,
+    stop_recording,
 };
 use realsense::ensure_realsense_sdk;
 
 pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
-    if args.first().map(String::as_str) != Some("live") {
-        return Err("expected helper mode: live".to_string());
+    match args.first().map(String::as_str) {
+        Some("live") => run_live_realsense_helper(&args[1..]),
+        Some("record") => run_record_realsense_helper(&args[1..]),
+        Some(mode) => Err(format!("unknown helper mode: {mode}")),
+        None => Err("missing helper mode".to_string()),
     }
-    let frame_path = PathBuf::from(args.get(1).ok_or_else(|| "missing frame path".to_string())?);
+}
+
+fn run_live_realsense_helper(args: &[String]) -> Result<(), String> {
+    let frame_path = PathBuf::from(args.first().ok_or_else(|| "missing frame path".to_string())?);
     let width = args
-        .get(2)
+        .get(1)
         .ok_or_else(|| "missing width".to_string())?
         .parse::<u32>()
         .map_err(|error| format!("invalid width: {error}"))?;
     let height = args
-        .get(3)
+        .get(2)
         .ok_or_else(|| "missing height".to_string())?
         .parse::<u32>()
         .map_err(|error| format!("invalid height: {error}"))?;
     let fps = args
-        .get(4)
+        .get(3)
         .ok_or_else(|| "missing fps".to_string())?
         .parse::<u32>()
         .map_err(|error| format!("invalid fps: {error}"))?;
-    let session_id = args.get(5).ok_or_else(|| "missing session id".to_string())?.clone();
-    let log_path = PathBuf::from(args.get(6).ok_or_else(|| "missing log path".to_string())?);
+    let session_id = args
+        .get(4)
+        .ok_or_else(|| "missing session id".to_string())?
+        .clone();
+    let log_path = PathBuf::from(args.get(5).ok_or_else(|| "missing log path".to_string())?);
 
     let config = ResolvedCaptureConfig {
         width,
@@ -92,12 +103,165 @@ pub fn run_realsense_helper(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_record_realsense_helper(args: &[String]) -> Result<(), String> {
+    let session_root = PathBuf::from(
+        args.first()
+            .ok_or_else(|| "missing recording session root".to_string())?,
+    );
+    let session_id = args
+        .get(1)
+        .ok_or_else(|| "missing recording session id".to_string())?
+        .clone();
+    let config_path = PathBuf::from(
+        args.get(2)
+            .ok_or_else(|| "missing recording config path".to_string())?,
+    );
+    let progress_path = PathBuf::from(
+        args.get(3)
+            .ok_or_else(|| "missing recording progress path".to_string())?,
+    );
+    let stop_path = PathBuf::from(
+        args.get(4)
+            .ok_or_else(|| "missing recording stop path".to_string())?,
+    );
+    let log_path = PathBuf::from(
+        args.get(5)
+            .ok_or_else(|| "missing recording log path".to_string())?,
+    );
+    let config_data = fs::read(&config_path)
+        .map_err(|error| format!("failed to read recording config: {error}"))?;
+    let config: ResolvedCaptureConfig = serde_json::from_slice(&config_data)
+        .map_err(|error| format!("invalid recording config: {error}"))?;
+    let session = storage::open_session(session_id.clone(), session_root)?;
+
+    clear_stale_realsense_helpers();
+    clear_camera_daemon_owners();
+    let mut camera = match realsense::RealSenseCamera::open(&config) {
+        Ok(camera) => camera,
+        Err(error) => {
+            let message = format!("failed to open RealSense for recording: {error}");
+            let _ = publish_capture_event(
+                &progress_path,
+                &CaptureEvent {
+                    kind: "error".to_string(),
+                    summary: None,
+                    message: Some(message.clone()),
+                },
+            );
+            let _ = storage::finish_session(&session, &config, "realsense", "failed", 0);
+            return Err(message);
+        }
+    };
+    drop_privileges_after_camera_open()?;
+    let _ = helper_log(&log_path, "privileged RealSense recording stream opened");
+    publish_capture_event(
+        &progress_path,
+        &CaptureEvent {
+            kind: "ready".to_string(),
+            summary: None,
+            message: Some("RealSense recording stream opened".to_string()),
+        },
+    )?;
+
+    let interval = Duration::from_secs_f64(1.0 / config.fps.max(1) as f64);
+    let mut frame_index = 0u32;
+    let mut consecutive_errors = 0u32;
+    let mut final_status = "stopped";
+    while !stop_path.exists() {
+        if config
+            .max_frames
+            .is_some_and(|max_frames| frame_index >= max_frames)
+        {
+            final_status = "finished";
+            break;
+        }
+        let loop_started = Instant::now();
+        match camera.capture_frame() {
+            Ok(frame) => {
+                consecutive_errors = 0;
+                frame_index += 1;
+                match storage::write_frame(&session, &config, frame_index, &frame) {
+                    Ok(summary) => publish_capture_event(
+                        &progress_path,
+                        &CaptureEvent {
+                            kind: "frame".to_string(),
+                            summary: Some(summary),
+                            message: None,
+                        },
+                    )?,
+                    Err(error) => {
+                        let message = format!("failed to save frame {frame_index}: {error}");
+                        let _ = helper_log(&log_path, &message);
+                        publish_capture_event(
+                            &progress_path,
+                            &CaptureEvent {
+                                kind: "error".to_string(),
+                                summary: None,
+                                message: Some(message),
+                            },
+                        )?;
+                        consecutive_errors += 1;
+                    }
+                }
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                let message = format!("RealSense recording capture failed: {error}");
+                let _ = helper_log(&log_path, &message);
+                publish_capture_event(
+                    &progress_path,
+                    &CaptureEvent {
+                        kind: "error".to_string(),
+                        summary: None,
+                        message: Some(message),
+                    },
+                )?;
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if consecutive_errors >= 8 {
+            final_status = "failed";
+            break;
+        }
+        let elapsed = loop_started.elapsed();
+        if elapsed < interval {
+            thread::sleep(interval - elapsed);
+        }
+    }
+
+    storage::finish_session(
+        &session,
+        &config,
+        "realsense",
+        final_status,
+        frame_index,
+    )?;
+    publish_capture_event(
+        &progress_path,
+        &CaptureEvent {
+            kind: "finished".to_string(),
+            summary: None,
+            message: Some(format!("{final_status}: {frame_index} frames")),
+        },
+    )
+}
+
+fn publish_capture_event(path: &PathBuf, event: &CaptureEvent) -> Result<(), String> {
+    let json = serde_json::to_vec(event)
+        .map_err(|error| format!("failed to encode recording progress: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)
+        .map_err(|error| format!("failed to write recording progress: {error}"))?;
+    fs::rename(&tmp, path)
+        .map_err(|error| format!("failed to publish recording progress: {error}"))
+}
+
 fn clear_stale_realsense_helpers() {
     let own_pid = std::process::id();
     let output = std::process::Command::new("pgrep")
         .args([
             "-f",
-            "smart-agriculture-tomato-twin --realsense-helper live|realsense-helper live",
+            "(smart-agriculture-tomato-twin|realsense-helper) --realsense-helper (live|record)",
         ])
         .output();
 
@@ -145,11 +309,19 @@ fn drop_privileges_after_camera_open() -> Result<(), String> {
         let real_uid = libc::getuid();
         let effective_uid = libc::geteuid();
         let real_gid = libc::getgid();
-        if effective_uid == 0 && real_uid != 0 {
-            if libc::setgid(real_gid) != 0 {
+        let target_uid = std::env::var("TOMATO_TWIN_UID")
+            .ok()
+            .and_then(|value| value.parse::<libc::uid_t>().ok())
+            .unwrap_or(real_uid);
+        let target_gid = std::env::var("TOMATO_TWIN_GID")
+            .ok()
+            .and_then(|value| value.parse::<libc::gid_t>().ok())
+            .unwrap_or(real_gid);
+        if effective_uid == 0 && target_uid != 0 {
+            if libc::setgid(target_gid) != 0 {
                 return Err("failed to drop helper group privileges".to_string());
             }
-            if libc::setuid(real_uid) != 0 {
+            if libc::setuid(target_uid) != 0 {
                 return Err("failed to drop helper user privileges".to_string());
             }
         }
@@ -175,11 +347,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             probe_runtime,
             list_devices,
+            privileged_helper_status,
+            ensure_privileged_helper,
             install_privileged_helper,
             start_preview,
             start_privileged_preview,
             read_privileged_preview_frame,
             read_latest_privileged_preview_frame,
+            read_privileged_recording_frame,
             stop_privileged_preview,
             stop_preview,
             start_recording,

@@ -12,7 +12,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, State};
+use sha2::{Digest, Sha256};
+use tauri::{Emitter, Manager, State};
 
 use crate::{realsense, storage};
 
@@ -29,6 +30,28 @@ struct RecordingHandle {
     stop: Arc<AtomicBool>,
     frames_written: Arc<AtomicU32>,
     handle: Option<JoinHandle<()>>,
+    helper: Option<PrivilegedRecordingControl>,
+}
+
+struct PrivilegedRecordingControl {
+    config_path: PathBuf,
+    progress_path: PathBuf,
+    stop_path: PathBuf,
+    pid_path: PathBuf,
+    launch_mode: String,
+}
+
+impl Drop for PrivilegedRecordingControl {
+    fn drop(&mut self) {
+        for path in [
+            &self.config_path,
+            &self.progress_path,
+            &self.stop_path,
+            &self.pid_path,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 struct PreviewHandle {
@@ -215,6 +238,7 @@ pub struct SessionStarted {
     pub root: String,
     pub backend: String,
     pub notice: Option<String>,
+    pub progress_path: Option<String>,
     pub config: ResolvedCaptureConfig,
 }
 
@@ -242,14 +266,16 @@ pub struct PrivilegedPreviewStarted {
 pub struct InstalledHelper {
     pub path: String,
     pub status: String,
+    pub ready: bool,
+    pub current: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CaptureEvent {
-    kind: String,
-    summary: Option<FrameSummary>,
-    message: Option<String>,
+pub(crate) struct CaptureEvent {
+    pub kind: String,
+    pub summary: Option<FrameSummary>,
+    pub message: Option<String>,
 }
 
 #[tauri::command]
@@ -279,6 +305,31 @@ pub fn start_recording(
         return Err("recording is already active".to_string());
     }
 
+    if cfg!(target_os = "macos") && config.backend != "synthetic" {
+        let started = start_privileged_recording(app, &config)?;
+        let progress_path = started
+            .helper
+            .as_ref()
+            .map(|helper| helper.progress_path.to_string_lossy().to_string());
+        let response = SessionStarted {
+            session_id: started.session_id.clone(),
+            root: started.root.to_string_lossy().to_string(),
+            backend: started.backend.clone(),
+            notice: Some(format!(
+                "RealSense recording uses the privileged helper ({})",
+                started
+                    .helper
+                    .as_ref()
+                    .map(|helper| helper.launch_mode.as_str())
+                    .unwrap_or("unknown")
+            )),
+            progress_path,
+            config,
+        };
+        *guard = Some(started);
+        return Ok(response);
+    }
+
     let (mut backend, backend_name, notice) = create_backend(&config)?;
     let session = storage::create_session(&config, &backend_name)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -289,6 +340,7 @@ pub fn start_recording(
     let thread_session = session.clone();
     let thread_config = config.clone();
     let backend_for_thread = backend_name.clone();
+    let session_id_for_cleanup = session.session_id.clone();
 
     let handle = thread::spawn(move || {
         let interval = Duration::from_secs_f64(1.0 / thread_config.fps as f64);
@@ -356,6 +408,7 @@ pub fn start_recording(
                 message: Some(format!("{status}: {count} frames")),
             },
         );
+        cleanup_finished_recording(&app, &session_id_for_cleanup);
     });
 
     *guard = Some(RecordingHandle {
@@ -365,6 +418,7 @@ pub fn start_recording(
         stop,
         frames_written,
         handle: Some(handle),
+        helper: None,
     });
 
     Ok(SessionStarted {
@@ -372,8 +426,224 @@ pub fn start_recording(
         root: session.root.to_string_lossy().to_string(),
         backend: backend_name,
         notice,
+        progress_path: None,
         config,
     })
+}
+
+fn start_privileged_recording(
+    app: tauri::AppHandle,
+    config: &ResolvedCaptureConfig,
+) -> Result<RecordingHandle, String> {
+    let session = storage::create_session(config, "realsense")?;
+    let helper_id = format!(
+        "realsense_recording_{}_{}",
+        chrono::Local::now().format("%H%M%S"),
+        std::process::id()
+    );
+    let temp_dir = std::env::temp_dir();
+    let config_path = temp_dir.join(format!("{helper_id}_config.json"));
+    let progress_path = temp_dir.join(format!("{helper_id}_progress.json"));
+    let stop_path = temp_dir.join(format!("{helper_id}.stop"));
+    let pid_path = temp_dir.join(format!("{helper_id}.pid"));
+    let log_path = temp_dir.join(format!("{helper_id}.log"));
+    for stale in [&progress_path, &stop_path, &pid_path] {
+        let _ = fs::remove_file(stale);
+    }
+    fs::write(
+        &config_path,
+        serde_json::to_vec(config)
+            .map_err(|error| format!("failed to encode helper recording config: {error}"))?,
+    )
+    .map_err(|error| format!("failed to write helper recording config: {error}"))?;
+
+    let helper_args = [
+        session.root.to_string_lossy().to_string(),
+        session.session_id.clone(),
+        config_path.to_string_lossy().to_string(),
+        progress_path.to_string_lossy().to_string(),
+        stop_path.to_string_lossy().to_string(),
+        log_path.to_string_lossy().to_string(),
+    ];
+    let launch_mode = if let Some(helper) = installed_helper_if_ready() {
+        let stderr = fs::File::create(&log_path)
+            .map_err(|error| format!("failed to create recording helper log: {error}"))?;
+        let child = Command::new(&helper)
+            .arg("--realsense-helper")
+            .arg("record")
+            .args(&helper_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|error| format!("failed to start installed recording helper: {error}"))?;
+        fs::write(&pid_path, child.id().to_string())
+            .map_err(|error| format!("failed to write recording helper pid: {error}"))?;
+        "installed-helper".to_string()
+    } else {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("failed to locate app executable: {error}"))?;
+        let kill_daemons = "killall -9 UVCAssistant VDCAssistant cameracaptured appleh16camerad AppleCameraAssistant com.apple.cmio.registerassistantservice 2>/dev/null || true";
+        let kill_helpers = "pkill -9 -f '(smart-agriculture-tomato-twin|realsense-helper) --realsense-helper (live|record)' 2>/dev/null || true";
+        let (user_uid, user_gid) = invoking_user_ids();
+        let shell = format!(
+            "{kill_helpers}; {kill_daemons}; TOMATO_TWIN_UID={user_uid} TOMATO_TWIN_GID={user_gid} {} --realsense-helper record {} {} {} {} {} {} >>{} 2>&1 & echo $! > {}",
+            shell_quote(&exe.to_string_lossy()),
+            shell_quote(&helper_args[0]),
+            shell_quote(&helper_args[1]),
+            shell_quote(&helper_args[2]),
+            shell_quote(&helper_args[3]),
+            shell_quote(&helper_args[4]),
+            shell_quote(&helper_args[5]),
+            shell_quote(&log_path.to_string_lossy()),
+            shell_quote(&pid_path.to_string_lossy()),
+        );
+        let script = format!(
+            "do shell script {} with administrator privileges",
+            apple_script_string(&shell)
+        );
+        run_osascript_with_timeout(
+            PathBuf::from("/usr/bin/osascript"),
+            script,
+            Duration::from_secs(30),
+        )
+        .map_err(|error| format!("administrator recording helper failed: {error}"))?;
+        "administrator-osascript".to_string()
+    };
+
+    let ready_started = Instant::now();
+    loop {
+        if let Ok(bytes) = fs::read(&progress_path)
+            && let Ok(event) = serde_json::from_slice::<CaptureEvent>(&bytes)
+        {
+            match event.kind.as_str() {
+                "ready" | "frame" => break,
+                "error" => {
+                    let _ = stop_helper_process(&pid_path, &launch_mode);
+                    let _ =
+                        storage::finish_session(&session, config, "realsense", "failed", 0);
+                    return Err(event
+                        .message
+                        .unwrap_or_else(|| "recording helper failed to start".to_string()));
+                }
+                _ => {}
+            }
+        }
+        if !helper_pid_exists(&pid_path) {
+            let details = fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(format!(
+                "recording helper exited before the stream opened: {}",
+                details.lines().last().unwrap_or("no helper log")
+            ));
+        }
+        if ready_started.elapsed() > Duration::from_secs(25) {
+            let _ = stop_helper_process(&pid_path, &launch_mode);
+            return Err(format!(
+                "timed out waiting for RealSense recording stream; helper log: {}",
+                log_path.to_string_lossy()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let frames_written = Arc::new(AtomicU32::new(0));
+    let bridge = spawn_privileged_recording_event_bridge(
+        app,
+        session.session_id.clone(),
+        progress_path.clone(),
+        pid_path.clone(),
+        Arc::clone(&stop),
+        Arc::clone(&frames_written),
+    );
+
+    Ok(RecordingHandle {
+        session_id: session.session_id,
+        root: session.root,
+        backend: "realsense".to_string(),
+        stop,
+        frames_written,
+        handle: Some(bridge),
+        helper: Some(PrivilegedRecordingControl {
+            config_path,
+            progress_path,
+            stop_path,
+            pid_path,
+            launch_mode,
+        }),
+    })
+}
+
+fn spawn_privileged_recording_event_bridge(
+    app: tauri::AppHandle,
+    session_id: String,
+    progress_path: PathBuf,
+    pid_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    frames_written: Arc<AtomicU32>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_frame_index = 0u32;
+        let mut last_message = String::new();
+        let mut helper_exit_misses = 0u32;
+        loop {
+            if let Ok(bytes) = fs::read(&progress_path)
+                && let Ok(event) = serde_json::from_slice::<CaptureEvent>(&bytes)
+            {
+                if let Some(summary) = &event.summary {
+                    if summary.frame_index != last_frame_index {
+                        last_frame_index = summary.frame_index;
+                        frames_written.store(summary.frame_index, Ordering::SeqCst);
+                        let _ = app.emit("capture-progress", event.clone());
+                    }
+                } else if event.kind == "finished" {
+                    let _ = app.emit("capture-progress", event);
+                    break;
+                } else if event.kind == "error" {
+                    let message = event.message.clone().unwrap_or_default();
+                    if message != last_message {
+                        last_message = message;
+                        let _ = app.emit("capture-progress", event);
+                    }
+                }
+            }
+
+            if helper_pid_exists(&pid_path) {
+                helper_exit_misses = 0;
+            } else {
+                helper_exit_misses += 1;
+                if helper_exit_misses > 10 {
+                    let _ = app.emit(
+                        "capture-progress",
+                        CaptureEvent {
+                            kind: "finished".to_string(),
+                            summary: None,
+                            message: Some(format!(
+                                "recording helper exited: {} frames",
+                                frames_written.load(Ordering::SeqCst)
+                            )),
+                        },
+                    );
+                    break;
+                }
+            }
+            if stop.load(Ordering::SeqCst) && helper_exit_misses > 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(33));
+        }
+        cleanup_finished_recording(&app, &session_id);
+    })
+}
+
+fn cleanup_finished_recording(app: &tauri::AppHandle, session_id: &str) {
+    let state = app.state::<AppState>();
+    if let Ok(mut guard) = state.recording.try_lock()
+        && guard
+            .as_ref()
+            .is_some_and(|recording| recording.session_id == session_id)
+    {
+        guard.take();
+    }
 }
 
 #[tauri::command]
@@ -482,6 +752,7 @@ pub fn start_preview(
         root: String::new(),
         backend: backend_name,
         notice,
+        progress_path: None,
         config,
     })
 }
@@ -502,6 +773,7 @@ pub fn start_privileged_preview(
         let stderr = fs::File::create(&launch_log)
             .map_err(|error| format!("failed to create helper launch log: {error}"))?;
         let child = Command::new(&helper)
+            .arg("--realsense-helper")
             .arg("live")
             .arg(&frame_path)
             .arg(config.width.to_string())
@@ -531,9 +803,10 @@ pub fn start_privileged_preview(
     let osascript = PathBuf::from("/usr/bin/osascript");
 
     let kill_daemons = "killall -9 UVCAssistant VDCAssistant cameracaptured appleh16camerad AppleCameraAssistant com.apple.cmio.registerassistantservice 2>/dev/null || true";
-    let kill_helpers = "pkill -9 -f 'smart-agriculture-tomato-twin --realsense-helper live' 2>/dev/null || true; pkill -9 -f '/usr/local/libexec/tomato-twin/realsense-helper live' 2>/dev/null || true";
+    let kill_helpers = "pkill -9 -f '(smart-agriculture-tomato-twin|realsense-helper) --realsense-helper (live|record)' 2>/dev/null || true";
+    let (user_uid, user_gid) = invoking_user_ids();
     let shell = format!(
-        "{kill_helpers}; {kill_daemons}; (i=0; while [ $i -lt 80 ]; do {kill_daemons}; i=$((i+1)); sleep 0.05; done) >/dev/null 2>&1 & {} --realsense-helper live {} {} {} {} {} {} >/tmp/tomato-twin-helper-launch.log 2>&1 & echo $! > {}",
+        "{kill_helpers}; {kill_daemons}; (i=0; while [ $i -lt 80 ]; do {kill_daemons}; i=$((i+1)); sleep 0.05; done) >/dev/null 2>&1 & TOMATO_TWIN_UID={user_uid} TOMATO_TWIN_GID={user_gid} {} --realsense-helper live {} {} {} {} {} {} >/tmp/tomato-twin-helper-launch.log 2>&1 & echo $! > {}",
         shell_quote(&exe.to_string_lossy()),
         shell_quote(&frame_path.to_string_lossy()),
         config.width,
@@ -578,14 +851,46 @@ pub fn install_privileged_helper() -> Result<InstalledHelper, String> {
     run_osascript_with_timeout(PathBuf::from("/usr/bin/osascript"), script, Duration::from_secs(60))
         .map_err(|error| format!("helper install failed: {error}"))?;
 
-    if installed_helper_if_ready().is_none() {
-        return Err("helper was installed, but setuid permission is not active".to_string());
+    let status = privileged_helper_status()?;
+    if !status.ready || !status.current {
+        return Err(
+            "helper was installed, but root ownership, setuid permission, or executable integrity is not ready"
+                .to_string(),
+        );
     }
 
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn privileged_helper_status() -> Result<InstalledHelper, String> {
+    let source = helper_source_path()?;
+    let destination = installed_helper_path();
+    let ready = installed_helper_if_ready().is_some();
+    let current = ready && files_have_same_digest(&source, &destination).unwrap_or(false);
+    let status = if current {
+        "RealSense helper ready; preview and recording require no additional password".to_string()
+    } else if ready {
+        "RealSense helper update required once at startup".to_string()
+    } else {
+        "RealSense helper installation required once at startup".to_string()
+    };
     Ok(InstalledHelper {
         path: destination.to_string_lossy().to_string(),
-        status: "No-sudo RealSense helper installed".to_string(),
+        status,
+        ready,
+        current,
     })
+}
+
+#[tauri::command]
+pub fn ensure_privileged_helper() -> Result<InstalledHelper, String> {
+    let status = privileged_helper_status()?;
+    if status.ready && status.current {
+        Ok(status)
+    } else {
+        install_privileged_helper()
+    }
 }
 
 #[tauri::command]
@@ -593,6 +898,18 @@ pub fn read_privileged_preview_frame(frame_path: String) -> Result<FrameSummary,
     let bytes = fs::read(&frame_path)
         .map_err(|error| format!("waiting for RealSense preview frame: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid preview frame JSON: {error}"))
+}
+
+#[tauri::command]
+pub fn read_privileged_recording_frame(progress_path: String) -> Result<FrameSummary, String> {
+    let bytes = fs::read(&progress_path)
+        .map_err(|error| format!("waiting for RGB-D recording frame: {error}"))?;
+    let event = serde_json::from_slice::<CaptureEvent>(&bytes)
+        .map_err(|error| format!("invalid RGB-D recording progress JSON: {error}"))?;
+    event
+        .summary
+        .filter(|_| event.kind == "frame")
+        .ok_or_else(|| event.message.unwrap_or_else(|| "waiting for RGB-D recording frame".to_string()))
 }
 
 #[tauri::command]
@@ -652,14 +969,21 @@ pub fn read_latest_privileged_preview_frame() -> Result<FrameSummary, String> {
 
 #[tauri::command]
 pub fn stop_privileged_preview(pid_path: String, launch_mode: Option<String>) -> Result<(), String> {
-    let pid = fs::read_to_string(&pid_path)
-        .map_err(|error| format!("failed to read privileged preview pid: {error}"))?;
+    stop_helper_process(
+        &PathBuf::from(pid_path),
+        launch_mode.as_deref().unwrap_or("administrator-osascript"),
+    )
+}
+
+fn stop_helper_process(pid_path: &PathBuf, launch_mode: &str) -> Result<(), String> {
+    let pid = fs::read_to_string(pid_path)
+        .map_err(|error| format!("failed to read privileged helper pid: {error}"))?;
     let pid = pid.trim();
     if pid.is_empty() {
         return Ok(());
     }
 
-    if launch_mode.as_deref() == Some("installed-helper") {
+    if launch_mode == "installed-helper" {
         let status = Command::new("kill")
             .arg(pid)
             .status()
@@ -709,12 +1033,22 @@ pub fn stop_recording(state: State<'_, AppState>) -> Result<SessionStopped, Stri
         .ok_or_else(|| "recording is not active".to_string())?;
 
     recording.stop.store(true, Ordering::SeqCst);
+    if let Some(helper) = &recording.helper {
+        fs::write(&helper.stop_path, b"stop")
+            .map_err(|error| format!("failed to signal recording helper: {error}"))?;
+        let started = Instant::now();
+        while helper_pid_exists(&helper.pid_path) && started.elapsed() < Duration::from_secs(4) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if helper_pid_exists(&helper.pid_path) {
+            stop_helper_process(&helper.pid_path, &helper.launch_mode)?;
+        }
+    }
     if let Some(handle) = recording.handle.take() {
         handle
             .join()
             .map_err(|_| "recording thread did not finish cleanly".to_string())?;
     }
-
     Ok(SessionStopped {
         session_id: recording.session_id,
         root: recording.root.to_string_lossy().to_string(),
@@ -750,6 +1084,7 @@ pub fn reveal_path(path: String) -> Result<(), String> {
         .map_err(|error| format!("failed to reveal path: {error}"))
 }
 
+#[allow(clippy::type_complexity)]
 fn create_backend(
     config: &ResolvedCaptureConfig,
 ) -> Result<(Box<dyn CameraBackend>, String, Option<String>), String> {
@@ -763,14 +1098,10 @@ fn create_backend(
             let backend = realsense::RealSenseCamera::open(config)?;
             Ok((Box::new(backend), "realsense".to_string(), None))
         }
-        _ => match realsense::RealSenseCamera::open(config) {
-            Ok(backend) => Ok((Box::new(backend), "realsense".to_string(), None)),
-            Err(error) => Ok((
-                Box::new(SyntheticBackend::new(config)),
-                "synthetic".to_string(),
-                Some(format!("RealSense unavailable, using demo generator: {error}")),
-            )),
-        },
+        _ => {
+            let backend = realsense::RealSenseCamera::open(config)?;
+            Ok((Box::new(backend), "realsense".to_string(), None))
+        }
     }
 }
 
@@ -867,24 +1198,7 @@ fn installed_helper_path() -> PathBuf {
 }
 
 fn helper_source_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("failed to locate app executable: {error}"))?;
-    let exe_dir = exe
-        .parent()
-        .ok_or_else(|| "app executable has no parent directory".to_string())?;
-    let helper_name = if cfg!(target_os = "windows") {
-        "realsense-helper.exe"
-    } else {
-        "realsense-helper"
-    };
-    let helper = exe_dir.join(helper_name);
-    if helper.exists() {
-        return Ok(helper);
-    }
-    Err(format!(
-        "RealSense helper binary was not found at {}. Run `cargo build --manifest-path src-tauri/Cargo.toml --bin realsense-helper` first.",
-        helper.to_string_lossy()
-    ))
+    std::env::current_exe().map_err(|error| format!("failed to locate app executable: {error}"))
 }
 
 fn installed_helper_if_ready() -> Option<PathBuf> {
@@ -892,12 +1206,46 @@ fn installed_helper_if_ready() -> Option<PathBuf> {
     let metadata = fs::metadata(&path).ok()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o4000 == 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || mode & 0o4000 == 0
+            || mode & 0o022 != 0
+        {
             return None;
         }
     }
     Some(path)
+}
+
+fn files_have_same_digest(left: &PathBuf, right: &PathBuf) -> Result<bool, String> {
+    let left_metadata =
+        fs::metadata(left).map_err(|error| format!("failed to stat helper source: {error}"))?;
+    let right_metadata =
+        fs::metadata(right).map_err(|error| format!("failed to stat installed helper: {error}"))?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+    Ok(file_digest(left)? == file_digest(right)?)
+}
+
+fn file_digest(path: &PathBuf) -> Result<[u8; 32], String> {
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("failed to open helper binary: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to hash helper binary: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn run_osascript_with_timeout(osascript: PathBuf, script: String, timeout: Duration) -> Result<(), String> {
@@ -945,6 +1293,16 @@ fn shell_quote(value: &str) -> String {
 
 fn apple_script_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(unix)]
+fn invoking_user_ids() -> (u32, u32) {
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(not(unix))]
+fn invoking_user_ids() -> (u32, u32) {
+    (0, 0)
 }
 
 fn emit_error(app: &tauri::AppHandle, message: String) {
@@ -1056,10 +1414,105 @@ impl CameraBackend for SyntheticBackend {
 }
 
 pub fn default_output_root() -> Result<PathBuf, String> {
-    let root = dirs::document_dir()
+    let root = dirs::data_local_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("SmartAgricultureScans");
+        .join("Tomato Twin Capture")
+        .join("Scans");
     fs::create_dir_all(&root).map_err(|error| format!("failed to create output root: {error}"))?;
     Ok(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::{AssetBuildOptions, detect_asset_tools, generate_scan_assets};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn synthetic_recording_completes_the_native_asset_pipeline() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let output_root = std::env::temp_dir().join(format!(
+            "tomato-twin-recording-e2e-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&output_root).expect("create synthetic output root");
+        let config = ResolvedCaptureConfig {
+            width: 96,
+            height: 72,
+            fps: 30,
+            backend: "synthetic".to_string(),
+            target_label: "e2e_tomato".to_string(),
+            cultivar: "test".to_string(),
+            notes: "native pipeline test".to_string(),
+            max_frames: Some(4),
+            point_stride: 2,
+            min_depth_m: 0.12,
+            max_depth_m: 1.4,
+        };
+        let session =
+            storage::create_session_at(&output_root, &config, "synthetic").expect("create session");
+        let mut camera = SyntheticBackend::new(&config);
+        for frame_index in 1..=4 {
+            let frame = camera.capture_frame().expect("capture synthetic RGB-D");
+            let summary = storage::write_frame(&session, &config, frame_index, &frame)
+                .expect("persist synthetic RGB-D frame");
+            assert!(summary.paths.rgb.is_some());
+            assert!(PathBuf::from(summary.paths.depth).is_file());
+            assert!(PathBuf::from(summary.paths.point_cloud).is_file());
+            assert!(PathBuf::from(summary.paths.metadata).is_file());
+        }
+        storage::finish_session(&session, &config, "synthetic", "finished", 4)
+            .expect("finish synthetic session");
+
+        let result = generate_scan_assets(AssetBuildOptions {
+            session_root: session.root.to_string_lossy().to_string(),
+            max_points: Some(30_000),
+            frame_stride: Some(1),
+            depth_decimation: Some(2),
+            gaussian_radius_m: Some(0.006),
+            turntable_degrees: Some(360.0),
+            export_fbx: Some(true),
+            use_mlx: Some(false),
+            mlx_iterations: Some(0),
+            mlx_voxel_size_m: Some(0.003),
+            mlx_train_size: Some(64),
+            mlx_max_train_views: Some(4),
+            collider_max_faces: Some(5_000),
+        })
+        .expect("generate native assets from recorded frames");
+
+        assert!(PathBuf::from(&result.gaussian_ply).is_file());
+        assert!(PathBuf::from(&result.splat).is_file());
+        assert!(PathBuf::from(result.mesh_fbx.expect("native FBX path")).is_file());
+        assert!(PathBuf::from(&result.preview_json).is_file());
+        assert_eq!(result.tools.fbx_exporter, "Built-in native FBX 7.4 exporter");
+        assert!(result.preview.points.len() > 1_000);
+
+        if detect_asset_tools().mlx_available {
+            let refined = generate_scan_assets(AssetBuildOptions {
+                session_root: session.root.to_string_lossy().to_string(),
+                max_points: Some(10_000),
+                frame_stride: Some(1),
+                depth_decimation: Some(4),
+                gaussian_radius_m: Some(0.006),
+                turntable_degrees: Some(360.0),
+                export_fbx: Some(true),
+                use_mlx: Some(true),
+                mlx_iterations: Some(2),
+                mlx_voxel_size_m: Some(0.004),
+                mlx_train_size: Some(64),
+                mlx_max_train_views: Some(4),
+                collider_max_faces: Some(5_000),
+            })
+            .expect("run gsplat-mlx refinement on recorded frames");
+            assert!(refined.gaussian_ply.ends_with("tomato_gaussians_mlx.ply"));
+            assert!(refined.mlx_status.contains("gsplat-mlx"));
+            assert!(PathBuf::from(refined.splat).is_file());
+        }
+        let _ = fs::remove_dir_all(&output_root);
+    }
 }

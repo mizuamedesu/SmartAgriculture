@@ -6,6 +6,8 @@ use std::{
     process::Command,
     slice,
     sync::Arc,
+    thread,
+    time::Duration,
 };
 
 use libloading::Library;
@@ -567,14 +569,21 @@ unsafe impl Send for RealSenseCamera {}
 
 impl RealSenseCamera {
     pub fn open(config: &ResolvedCaptureConfig) -> Result<Self, String> {
-        Self::open_with_color(config, true).or_else(|color_error| {
-            Self::open_with_color(config, false).map_err(|depth_error| {
-                format!("RGB-D open failed: {color_error}; depth-only open failed: {depth_error}")
-            })
-        })
+        let mut errors = Vec::new();
+        for attempt in 1..=3 {
+            match Self::open_rgbd(config) {
+                Ok(camera) => return Ok(camera),
+                Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+            }
+            thread::sleep(Duration::from_millis(450));
+        }
+        Err(format!(
+            "RGB-D is required, but the synchronized color and depth stream did not open: {}",
+            errors.join(" | ")
+        ))
     }
 
-    fn open_with_color(config: &ResolvedCaptureConfig, enable_color: bool) -> Result<Self, String> {
+    fn open_rgbd(config: &ResolvedCaptureConfig) -> Result<Self, String> {
         let api = Arc::new(Rs2Api::load()?);
         let api_version = api.api_version()?;
         let context = api.call(|error| unsafe { (api.rs2_create_context)(api_version, error) })?;
@@ -619,20 +628,18 @@ impl RealSenseCamera {
                     error,
                 )
             })?;
-            if enable_color {
-                api.call(|error| unsafe {
-                    (api.rs2_config_enable_stream)(
-                        rs_config,
-                        RS2_STREAM_COLOR,
-                        -1,
-                        config.width as c_int,
-                        config.height as c_int,
-                        RS2_FORMAT_RGB8,
-                        config.fps as c_int,
-                        error,
-                    )
-                })?;
-            }
+            api.call(|error| unsafe {
+                (api.rs2_config_enable_stream)(
+                    rs_config,
+                    RS2_STREAM_COLOR,
+                    -1,
+                    config.width as c_int,
+                    config.height as c_int,
+                    RS2_FORMAT_RGB8,
+                    config.fps as c_int,
+                    error,
+                )
+            })?;
             Ok(())
         };
 
@@ -664,13 +671,28 @@ impl RealSenseCamera {
             started: true,
         };
 
-        for _ in 0..4 {
-            if let Ok(frameset) = camera.wait_frameset(2_000) {
-                unsafe { (camera.api.rs2_release_frame)(frameset) };
+        let mut warmup_errors = Vec::new();
+        for _ in 0..2 {
+            match camera.wait_frameset(2_500) {
+                Ok(frameset) => {
+                    let frame = camera.read_frameset(frameset);
+                    unsafe { (camera.api.rs2_release_frame)(frameset) };
+                    match frame {
+                        Ok(frame) if frame.color.is_some() => return Ok(camera),
+                        Ok(_) => warmup_errors.push(
+                            "synchronized frameset did not include an RGB color frame".to_string(),
+                        ),
+                        Err(error) => warmup_errors.push(error),
+                    }
+                }
+                Err(error) => warmup_errors.push(error),
             }
         }
 
-        Ok(camera)
+        Err(format!(
+            "RGB-D stream started but no synchronized frame arrived: {}",
+            warmup_errors.join(" | ")
+        ))
     }
 
     fn wait_frameset(&self, timeout_ms: u32) -> Result<*mut Rs2Frame, String> {
@@ -1119,10 +1141,10 @@ fn detect_usb_realsense_devices() -> Vec<UsbRealSenseDevice> {
                     let minor = (value >> 4) & 0x0f;
                     device.usb_type = Some(format!("{major}.{minor}"));
                 }
-            } else if line.trim() == "}" {
-                if let Some(device) = current.take() {
-                    devices.push(device);
-                }
+            } else if line.trim() == "}"
+                && let Some(device) = current.take()
+            {
+                devices.push(device);
             }
         }
     }
@@ -1199,12 +1221,13 @@ fn detect_uvc_assistant_owner() -> Option<String> {
             in_realsense_interface = line.to_ascii_lowercase().contains("realsense");
         }
 
-        if in_realsense_interface && line.contains("\"UsbExclusiveOwner\"") {
-            if let Some(owner) = parse_ioreg_string(line) {
-                if owner.contains("UVCAssistant") && !owners.contains(&owner) {
-                    owners.push(owner);
-                }
-            }
+        if in_realsense_interface
+            && line.contains("\"UsbExclusiveOwner\"")
+            && let Some(owner) = parse_ioreg_string(line)
+            && owner.contains("UVCAssistant")
+            && !owners.contains(&owner)
+        {
+            owners.push(owner);
         }
     }
 
