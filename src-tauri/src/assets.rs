@@ -496,7 +496,7 @@ fn load_mcap_preview(recording: &Path) -> Result<AssetBuildResult, String> {
         mlx_iterations: Some(0),
         mlx_voxel_size_m: Some(0.0025),
         mlx_train_size: Some(1536),
-        mlx_max_train_views: Some(1),
+        mlx_max_train_views: Some(100),
         collider_max_faces: Some(35_000),
     })
 }
@@ -673,7 +673,7 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
         .unwrap_or(gaussian_radius_m * 0.75)
         .clamp(0.0005, 0.05);
     let mlx_train_size = options.mlx_train_size.unwrap_or(1_536).clamp(64, 1_536);
-    let mlx_max_train_views = options.mlx_max_train_views.unwrap_or(4).clamp(1, 4);
+    let mlx_max_train_views = options.mlx_max_train_views.unwrap_or(100).clamp(1, 512);
     let collider_max_faces = options
         .collider_max_faces
         .unwrap_or(35_000)
@@ -828,7 +828,7 @@ pub fn generate_scan_assets(options: AssetBuildOptions) -> Result<AssetBuildResu
             &sharp_raw_ply,
             &mlx_dir,
             sharp_budget,
-            mlx_max_train_views.min(4),
+            mlx_max_train_views,
         );
         if let Some(cache) = cleanup_cache {
             let _ = fs::remove_dir_all(cache);
@@ -2978,6 +2978,14 @@ mod tests {
                 "{actual:?} != {target:?}"
             );
         }
+    }
+
+    #[test]
+    fn sharp_keyframe_sampling_keeps_one_hundred_frames() {
+        let indices = sampled_frame_indices(685, 1, 100);
+        assert_eq!(indices.len(), 100);
+        assert_eq!(indices.first(), Some(&1));
+        assert_eq!(indices.last(), Some(&685));
     }
 
     #[test]

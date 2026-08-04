@@ -255,7 +255,7 @@ function App() {
     mlxIterations: 0,
     mlxVoxelSizeM: 0.0025,
     mlxTrainSize: 1536,
-    mlxMaxTrainViews: 4,
+    mlxMaxTrainViews: 100,
     colliderMaxFaces: 35000
   });
   const [recording, setRecording] = useState(false);
@@ -1642,7 +1642,13 @@ function ControlPanel(props: {
             <NumberField label="Depth sampling" value={props.assetOptions.depthDecimation} min={1} max={16} onChange={(v) => updateAsset("depthDecimation", v)} />
             <NumberField label="Point limit" value={props.assetOptions.maxPoints} min={5000} max={1500000} step={1000} onChange={(v) => updateAsset("maxPoints", v)} />
             <NumberField label="Radius m" value={props.assetOptions.gaussianRadiusM} min={0.0005} max={0.05} step={0.0005} onChange={(v) => updateAsset("gaussianRadiusM", v)} />
-            <NumberField label="Inference views" value={props.assetOptions.mlxMaxTrainViews} min={1} max={4} onChange={(v) => updateAsset("mlxMaxTrainViews", v)} />
+            <NumberField
+              label="Inference frames"
+              value={props.assetOptions.mlxMaxTrainViews}
+              min={100}
+              max={512}
+              onChange={(v) => updateAsset("mlxMaxTrainViews", Math.max(100, v))}
+            />
             <NumberField label="Collider faces" value={props.assetOptions.colliderMaxFaces} min={500} max={120000} step={500} onChange={(v) => updateAsset("colliderMaxFaces", v)} />
             <label className="flex h-[58px] items-end gap-2 pb-2 text-sm">
               <input

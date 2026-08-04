@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-ply", required=True, type=Path)
     parser.add_argument("--summary-json", required=True, type=Path)
     parser.add_argument("--max-points", type=int, default=600_000)
-    parser.add_argument("--max-views", type=int, default=3)
+    parser.add_argument("--max-views", type=int, default=100)
     return parser.parse_args()
 
 

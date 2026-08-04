@@ -39,7 +39,7 @@ pub fn rebuild_scan_assets_cli(session_root: &str) -> Result<String, String> {
         mlx_iterations: Some(0),
         mlx_voxel_size_m: Some(0.0025),
         mlx_train_size: Some(1536),
-        mlx_max_train_views: Some(4),
+        mlx_max_train_views: Some(100),
         collider_max_faces: Some(35_000),
     })?;
     serde_json::to_string_pretty(&serde_json::json!({
